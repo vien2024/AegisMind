@@ -9,7 +9,9 @@ export async function GET(request: Request) {
   const denied = await unauthorized();
   if (denied) return denied;
   const taskId = new URL(request.url).searchParams.get("taskId");
-  return Response.json({ approvals: repo.listApprovals(taskId ? Number(taskId) : undefined) });
+  return Response.json({
+    approvals: await repo.listApprovals(taskId ? Number(taskId) : undefined),
+  });
 }
 
 export async function POST(request: Request) {
@@ -19,13 +21,18 @@ export async function POST(request: Request) {
   if (!body.id || !["approved", "denied"].includes(body.decision ?? "")) {
     return badRequest("id and decision (approved|denied) are required");
   }
-  repo.setApprovalStatus(body.id, body.decision!);
-  const approval = repo.listApprovals().find((a) => a.id === body.id);
+  await repo.setApprovalStatus(body.id, body.decision!);
+  const approvals = await repo.listApprovals();
+  const approval = approvals.find((a) => a.id === body.id);
   if (approval?.task_id) {
-    emitEvent({ type: "approval", taskId: approval.task_id, payload: { approvalId: approval.id, status: body.decision } });
+    emitEvent({
+      type: "approval",
+      taskId: approval.task_id,
+      payload: { approvalId: approval.id, status: body.decision },
+    });
     // A decision unblocks the task: bring it back up so the engine can re-claim the intent.
-    const task = repo.getTask(approval.task_id);
-    if (task && task.status === "paused") resumeTask(task.id);
+    const task = await repo.getTask(approval.task_id);
+    if (task && task.status === "paused") await resumeTask(task.id);
   }
   return Response.json({ approval });
 }

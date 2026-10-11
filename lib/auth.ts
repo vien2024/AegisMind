@@ -17,56 +17,67 @@ function verifyPassword(password: string, salt: string, hash: string): boolean {
   return timingSafeEqual(candidate, expected);
 }
 
-export function hasAdmin(): boolean {
-  const row = db().prepare("SELECT COUNT(*) as n FROM users").get() as { n: number };
-  return row.n > 0;
+export async function hasAdmin(): Promise<boolean> {
+  const row = await db()
+    .prepare("SELECT COUNT(*) as n FROM users")
+    .get() as { n: number } | null;
+  return Boolean(row && row.n > 0);
 }
 
-export function createAdmin(username: string, password: string): number {
+export async function createAdmin(username: string, password: string): Promise<number> {
   const { salt, hash } = hashPassword(password);
-  const info = db()
+  const info = await db()
     .prepare(
-      "INSERT INTO users (username, password_hash, salt, created_at) VALUES (?, ?, ?, ?)",
+      "INSERT INTO users (username, password_hash, salt, created_at) VALUES ($1, $2, $3, $4) RETURNING id",
     )
     .run(username, hash, salt, now());
-  return Number(info.lastInsertRowid);
+  return info.lastInsertRowid;
 }
 
-export function authenticate(username: string, password: string): number | null {
-  const user = db()
-    .prepare("SELECT id, password_hash, salt FROM users WHERE username = ?")
-    .get(username) as { id: number; password_hash: string; salt: string } | undefined;
+export async function authenticate(
+  username: string,
+  password: string,
+): Promise<number | null> {
+  const user = await db()
+    .prepare("SELECT id, password_hash, salt FROM users WHERE username = $1")
+    .get(username) as
+    | { id: number; password_hash: string; salt: string }
+    | null;
   if (!user) return null;
   return verifyPassword(password, user.salt, user.password_hash) ? user.id : null;
 }
 
-export function createSession(userId: number): { token: string; expiresAt: string } {
+export async function createSession(userId: number): Promise<{ token: string; expiresAt: string }> {
   const token = randomBytes(32).toString("hex");
   const expiresAt = new Date(Date.now() + SESSION_TTL_MS).toISOString();
-  db()
+  await db()
     .prepare(
-      "INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
+      "INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES ($1, $2, $3, $4)",
     )
     .run(token, userId, now(), expiresAt);
   return { token, expiresAt };
 }
 
-export function destroySession(token: string): void {
-  db().prepare("DELETE FROM sessions WHERE token = ?").run(token);
+export async function destroySession(token: string): Promise<void> {
+  await db().prepare("DELETE FROM sessions WHERE token = $1").run(token);
 }
 
-export function sessionUser(token: string | undefined): { id: number; username: string } | null {
+export async function sessionUser(
+  token: string | undefined,
+): Promise<{ id: number; username: string } | null> {
   if (!token) return null;
-  const row = db()
+  const row = await db()
     .prepare(
       `SELECT u.id as id, u.username as username, s.expires_at as expires_at
        FROM sessions s JOIN users u ON u.id = s.user_id
-       WHERE s.token = ?`,
+       WHERE s.token = $1`,
     )
-    .get(token) as { id: number; username: string; expires_at: string } | undefined;
+    .get(token) as
+    | { id: number; username: string; expires_at: string }
+    | null;
   if (!row) return null;
   if (new Date(row.expires_at).getTime() < Date.now()) {
-    destroySession(token);
+    await destroySession(token);
     return null;
   }
   return { id: row.id, username: row.username };

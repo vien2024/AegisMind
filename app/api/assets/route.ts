@@ -13,17 +13,19 @@ export async function GET(request: Request) {
   const search = url.searchParams.get("search") ?? undefined;
   const kind = ASSET_KINDS.includes(kindParam as AssetKind) ? (kindParam as AssetKind) : undefined;
 
-  const assets = repo.listAssets({
+  const assets = await repo.listAssets({
     companyId: companyId ? Number(companyId) : undefined,
     kind,
     search,
   });
+  const companies = await repo.listCompanies();
+  const counts: Record<string, number> = {};
+  for (const asset of assets) {
+    counts[asset.kind] = (counts[asset.kind] ?? 0) + 1;
+  }
   return Response.json({
     assets: assets.slice(0, 1000),
-    companies: repo.listCompanies(),
-    counts: assets.reduce<Record<string, number>>((acc, asset) => {
-      acc[asset.kind] = (acc[asset.kind] ?? 0) + 1;
-      return acc;
-    }, {}),
+    companies,
+    counts,
   });
 }

@@ -7,12 +7,13 @@ export const dynamic = "force-dynamic";
 
 export default async function ToolExecutionsPage() {
   await requirePageUser();
-  const tasks = repo.listTasks();
+  const tasks = await repo.listTasks();
   const taskName = (id: number | null) => tasks.find((task) => task.id === id)?.name ?? null;
 
-  const approvals = repo.listApprovals();
-  const results = tasks
-    .flatMap((task) => repo.listActivity(task.id, 200))
+  const approvals = await repo.listApprovals();
+  const activityLists = await Promise.all(tasks.map((task) => repo.listActivity(task.id, 200)));
+  const results = activityLists
+    .flat()
     .filter((entry) => entry.type === "tool_result" || entry.type === "tool_use")
     .sort((a, b) => b.id - a.id)
     .slice(0, 200);

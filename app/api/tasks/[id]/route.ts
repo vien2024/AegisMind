@@ -9,16 +9,16 @@ export async function GET(_request: Request, { params }: Params) {
   const denied = await unauthorized();
   if (denied) return denied;
   const id = Number((await params).id);
-  const task = repo.getTask(id);
+  const task = await repo.getTask(id);
   if (!task) return Response.json({ error: "not found" }, { status: 404 });
-  const graph = taskGraph(id);
+  const graph = await taskGraph(id);
   return Response.json({
     task,
-    counts: repo.nodeKindCounts(id),
+    counts: await repo.nodeKindCounts(id),
     nodes: graph.nodes,
     edges: graph.edges,
     anchors: graph.anchors,
-    findings: repo.listFindings(id),
+    findings: await repo.listFindings(id),
     coverage: (await import("@/lib/task-service")).coverageReport(id),
   });
 }
@@ -27,7 +27,7 @@ export async function PATCH(request: Request, { params }: Params) {
   const denied = await unauthorized();
   if (denied) return denied;
   const id = Number((await params).id);
-  const task = repo.getTask(id);
+  const task = await repo.getTask(id);
   if (!task) return Response.json({ error: "not found" }, { status: 404 });
   const body = (await request.json().catch(() => ({}))) as {
     name?: string;
@@ -40,7 +40,7 @@ export async function PATCH(request: Request, { params }: Params) {
   if (body.concurrency !== undefined && (body.concurrency < 1 || body.concurrency > 10)) {
     return badRequest("concurrency must be between 1 and 10");
   }
-  repo.updateTask(id, {
+  await repo.updateTask(id, {
     name: body.name,
     description: body.description,
     goal: body.goal,
@@ -48,14 +48,14 @@ export async function PATCH(request: Request, { params }: Params) {
     concurrency: body.concurrency,
     auto_approve: body.autoApprove === undefined ? undefined : body.autoApprove ? 1 : 0,
   });
-  return Response.json({ task: repo.getTask(id) });
+  return Response.json({ task: await repo.getTask(id) });
 }
 
 export async function DELETE(_request: Request, { params }: Params) {
   const denied = await unauthorized();
   if (denied) return denied;
   const id = Number((await params).id);
-  if (!repo.getTask(id)) return Response.json({ error: "not found" }, { status: 404 });
-  repo.deleteTask(id);
+  if (!await repo.getTask(id)) return Response.json({ error: "not found" }, { status: 404 });
+  await repo.deleteTask(id);
   return Response.json({ ok: true });
 }

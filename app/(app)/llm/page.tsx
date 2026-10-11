@@ -6,7 +6,7 @@ export const dynamic = "force-dynamic";
 
 export default async function LlmPage() {
   await requirePageUser();
-  const configs = repo.listLlmConfigs().map((config) => ({
+  const configs = (await repo.listLlmConfigs()).map((config) => ({
     id: config.id,
     name: config.name,
     provider: config.provider,
@@ -17,7 +17,7 @@ export default async function LlmPage() {
     is_active: config.is_active,
   }));
   const since = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString();
-  const totals = repo.usageTotals();
+  const totals = await repo.usageTotals();
 
   return (
     <LlmClient
@@ -35,8 +35,8 @@ export default async function LlmPage() {
           ...totals,
           cacheHitRate: totals.total > 0 ? Math.round((totals.cacheRead / totals.total) * 100) : 0,
         },
-        byModel: repo.usageByModel(),
-        series: repo.usageSeries(since, "month"),
+        byModel: await repo.usageByModel(),
+        series: await repo.usageSeries(since, "month"),
       }}
     />
   );

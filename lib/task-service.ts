@@ -11,13 +11,16 @@ export function classifyTarget(target: string): { kind: AssetKind; value: string
   return { kind: "root_domain", value: trimmed.replace(/\/$/, "") };
 }
 
-export function ensureDefaultCompany() {
-  const companies = repo.listCompanies();
+export async function ensureDefaultCompany() {
+  const companies = await repo.listCompanies();
   if (companies.length) return companies[0]!;
-  return repo.createCompany("Default", "Auto-created company for assets discovered during exploration.");
+  return repo.createCompany(
+    "Default",
+    "Auto-created company for assets discovered during exploration.",
+  );
 }
 
-export function createTaskFromInput(input: {
+export async function createTaskFromInput(input: {
   name: string;
   target: string;
   description?: string;
@@ -25,19 +28,19 @@ export function createTaskFromInput(input: {
   language?: Language;
   concurrency?: number;
   autoApprove?: boolean;
-}): Task {
-  seedDemoData();
-  const task = repo.createTask(input);
-  const company = ensureDefaultCompany();
+}): Promise<Task> {
+  await seedDemoData();
+  const task = await repo.createTask(input);
+  const company = await ensureDefaultCompany();
   const { kind, value } = classifyTarget(input.target);
-  const { asset } = repo.upsertAsset({
+  const { asset } = await repo.upsertAsset({
     companyId: company.id,
     kind,
     value,
     attributes: { source: "task-target" },
   });
-  repo.addTaskScope(task.id, [asset.id]);
-  repo.createNode({
+  await repo.addTaskScope(task.id, [asset.id]);
+  await repo.createNode({
     taskId: task.id,
     kind: "goal",
     title: input.goal?.trim() || `Map the attack surface of ${value} and record findings.`,
@@ -47,24 +50,30 @@ export function createTaskFromInput(input: {
   return task;
 }
 
-export function taskGraph(taskId: number) {
-  const nodes = repo.listNodes(taskId, undefined, 1000);
-  const edges = repo.listEdges(taskId);
-  const anchors = nodes.map((node) => ({ node_id: node.id, asset_ids: repo.listAnchoredAssetIds(node.id) }));
+export async function taskGraph(taskId: number) {
+  const nodes = await repo.listNodes(taskId, undefined, 1000);
+  const edges = await repo.listEdges(taskId);
+  const anchors = await Promise.all(
+    nodes.map(async (node) => ({
+      node_id: node.id,
+      asset_ids: await repo.listAnchoredAssetIds(node.id),
+    })),
+  );
   const assetIds = new Set(anchors.flatMap((anchor) => anchor.asset_ids));
-  const assets = [...assetIds]
-    .map((id) => repo.getAsset(id))
-    .filter((asset): asset is NonNullable<typeof asset> => Boolean(asset))
+  const assets = (await Promise.all(
+    [...assetIds].map((id) => repo.getAsset(id)),
+  ))
+    .filter((asset): asset is NonNullable<typeof asset> => asset != null)
     .map((asset) => ({ id: asset.id, kind: asset.kind, value: asset.value }));
   return { nodes, edges, anchors, assets };
 }
 
-export function coverageReport(taskId: number) {
-  const scope = repo.listScopeAssets(taskId);
+export async function coverageReport(taskId: number) {
+  const scope = await repo.listScopeAssets(taskId);
   const tested = new Set<number>();
   for (const asset of scope) {
-    for (const nodeId of repo.listNodeIdsForAsset(asset.id)) {
-      const node = repo.getNode(nodeId);
+    for (const nodeId of await repo.listNodeIdsForAsset(asset.id)) {
+      const node = await repo.getNode(nodeId);
       if (node && ["intent", "fact", "finding"].includes(node.kind)) tested.add(asset.id);
     }
   }

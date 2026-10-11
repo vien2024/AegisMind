@@ -12,8 +12,8 @@ export default async function TrafficPage({
   await requirePageUser();
   const params = await searchParams;
   const taskId = params.taskId ? Number(params.taskId) : undefined;
-  const traffic = repo.listTraffic(taskId, 300);
-  const tasks = repo.listTasks();
+  const traffic = await repo.listTraffic(taskId, 300);
+  const tasks = await repo.listTasks();
 
   return (
     <>

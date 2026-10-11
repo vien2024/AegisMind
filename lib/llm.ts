@@ -5,11 +5,10 @@ import { createMockModel, type MockStep } from "./mock-model";
 import { getActiveLlmConfig } from "./repo";
 import type { ProviderId } from "./types";
 
-/**
- * OpenAI-compatible multi-provider gateways. They speak the Chat Completions
- * wire format, so the AI SDK `createOpenAI` provider drives them; only the
- * default base URL and the environment key that can substitute for a stored
- * key differ from plain OpenAI.
+/** OpenAI-compatible multi-provider gateways. They speak the Chat Completions
+ *  wire format, so the AI SDK `createOpenAI` provider drives them; only the
+ *  default base URL and the environment key that can substitute for a stored
+ *  key differ from plain OpenAI.
  */
 export interface GatewaySpec {
   label: string;
@@ -74,18 +73,26 @@ export interface MockFallback {
  * The offline simulator is a real `LanguageModelV4` (see lib/mock-model.ts), so
  * the agent code path through the AI SDK is identical in every mode.
  */
-export function resolveModel(mock: MockFallback): ResolvedModel {
-  const config = getActiveLlmConfig();
+export async function resolveModel(mock: MockFallback): Promise<ResolvedModel> {
+  const config = await getActiveLlmConfig();
 
   if (config) {
     if (config.provider === "mock") {
-      return { model: createMockModel(mock), provider: "mock", modelId: config.model, live: false };
+      return {
+        model: createMockModel(mock),
+        provider: "mock",
+        modelId: config.model,
+        live: false,
+      };
     }
     if (isOpenAICompatible(config.provider)) {
       const gateway = gatewayFor(config.provider);
       const provider = createOpenAI({
-        apiKey: config.api_key || (gateway ? process.env[gateway.envKey] : process.env.OPENAI_API_KEY),
-        baseURL: config.base_url || gateway?.baseURL || undefined,
+        apiKey:
+          config.api_key ||
+          (gateway ? process.env[gateway.envKey] : process.env.OPENAI_API_KEY),
+        baseURL:
+          config.base_url || gateway?.baseURL || undefined,
       });
       return {
         model: provider(config.model) as unknown as LanguageModel,
@@ -99,7 +106,12 @@ export function resolveModel(mock: MockFallback): ResolvedModel {
         apiKey: config.api_key || process.env.ANTHROPIC_API_KEY,
         baseURL: config.base_url || undefined,
       });
-      return { model: provider(config.model) as unknown as LanguageModel, provider: "anthropic", modelId: config.model, live: true };
+      return {
+        model: provider(config.model) as unknown as LanguageModel,
+        provider: "anthropic",
+        modelId: config.model,
+        live: true,
+      };
     }
   }
 
@@ -135,7 +147,12 @@ export function resolveModel(mock: MockFallback): ResolvedModel {
     };
   }
 
-  return { model: createMockModel(mock), provider: "mock", modelId: mock.modelId ?? "aegismind-simulator", live: false };
+  return {
+    model: createMockModel(mock),
+    provider: "mock",
+    modelId: mock.modelId ?? "aegismind-simulator",
+    live: false,
+  };
 }
 
 /** Build a model from explicit, not-yet-saved parameters (used by the connection test). */
@@ -148,7 +165,9 @@ export function buildModelFromParams(input: {
   if (isOpenAICompatible(input.provider)) {
     const gateway = gatewayFor(input.provider);
     const provider = createOpenAI({
-      apiKey: input.apiKey || (gateway ? process.env[gateway.envKey] : process.env.OPENAI_API_KEY),
+      apiKey:
+        input.apiKey ||
+        (gateway ? process.env[gateway.envKey] : process.env.OPENAI_API_KEY),
       baseURL: input.baseUrl || gateway?.baseURL || undefined,
     });
     return {
@@ -176,12 +195,4 @@ export function buildModelFromParams(input: {
     modelId: input.model,
     live: false,
   };
-}
-
-export function isLiveConfigured(): boolean {
-  const envKeys = ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", ...Object.values(GATEWAYS).map((entry) => entry.envKey)];
-  const hasEnvKey = envKeys.some((key) => Boolean(process.env[key]));
-  const config = getActiveLlmConfig();
-  if (config && config.provider !== "mock" && (config.api_key || hasEnvKey)) return true;
-  return hasEnvKey;
 }

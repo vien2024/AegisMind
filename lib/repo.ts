@@ -1,4 +1,4 @@
-import { db, now, parseJson, getSetting, setSetting } from "./db";
+import { db, now, parseJson, getSetting, setSetting, type TransactionClient } from "./db";
 export { resolveDbPath } from "./db";
 import type {
   ActivityRecord,
@@ -25,23 +25,31 @@ import type {
 /* Companies                                                           */
 /* ------------------------------------------------------------------ */
 
-export function listCompanies(): Company[] {
-  return db().prepare("SELECT * FROM companies ORDER BY id").all() as Company[];
+export async function listCompanies(): Promise<Company[]> {
+  const rows = await db()
+    .prepare("SELECT * FROM companies ORDER BY id")
+    .all();
+  return rows as unknown as Company[];
 }
 
-export function getCompany(id: number): Company | undefined {
-  return db().prepare("SELECT * FROM companies WHERE id = ?").get(id) as
-    | Company
-    | undefined;
+export async function getCompany(id: number): Promise<Company | undefined> {
+  const row = await db()
+    .prepare("SELECT * FROM companies WHERE id = $1")
+    .get(id);
+  return row as unknown as Company | undefined;
 }
 
-export function createCompany(name: string, description?: string): Company {
-  const info = db()
+export async function createCompany(
+  name: string,
+  description?: string,
+): Promise<Company> {
+  const info = await db()
     .prepare(
-      "INSERT INTO companies (name, description, created_at) VALUES (?, ?, ?)",
+      "INSERT INTO companies (name, description, created_at) VALUES ($1, $2, $3) RETURNING id",
     )
     .run(name, description ?? null, now());
-  return getCompany(Number(info.lastInsertRowid))!;
+  const id = info.lastInsertRowid;
+  return (await getCompany(id))!;
 }
 
 /* ------------------------------------------------------------------ */
@@ -49,68 +57,72 @@ export function createCompany(name: string, description?: string): Company {
 /* ------------------------------------------------------------------ */
 
 function assetRow(row: unknown): Asset {
-  const r = row as Asset & { attributes: string | null };
-  return { ...r, attributes: parseJson<Record<string, unknown> | null>(r.attributes, null) };
+  const r = row as unknown as Asset & { attributes: string | null };
+  return {
+    ...r,
+    attributes: parseJson<Record<string, unknown> | null>(r.attributes, null),
+  };
 }
 
-export function listAssets(filter?: {
+export async function listAssets(filter?: {
   companyId?: number;
   kind?: AssetKind;
   search?: string;
   parentId?: number | null;
-}): Asset[] {
+}): Promise<Asset[]> {
   const clauses: string[] = [];
   const params: unknown[] = [];
   if (filter?.companyId) {
-    clauses.push("company_id = ?");
+    clauses.push("company_id = $" + (params.length + 1));
     params.push(filter.companyId);
   }
   if (filter?.kind) {
-    clauses.push("kind = ?");
+    clauses.push("kind = $" + (params.length + 1));
     params.push(filter.kind);
   }
   if (filter?.search) {
-    clauses.push("value LIKE ?");
+    clauses.push("value LIKE $" + (params.length + 1));
     params.push(`%${filter.search}%`);
   }
   if (filter?.parentId !== undefined) {
     if (filter.parentId === null) clauses.push("parent_id IS NULL");
     else {
-      clauses.push("parent_id = ?");
+      clauses.push("parent_id = $" + (params.length + 1));
       params.push(filter.parentId);
     }
   }
   const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
-  const rows = db()
-    .prepare(`SELECT * FROM assets ${where} ORDER BY kind, value`)
-    .all(...params);
+  const sql = `SELECT * FROM assets ${where} ORDER BY kind, value`;
+  const rows = await db().prepare(sql).all(...params);
   return rows.map(assetRow);
 }
 
-export function getAsset(id: number): Asset | undefined {
-  const row = db().prepare("SELECT * FROM assets WHERE id = ?").get(id);
+export async function getAsset(id: number): Promise<Asset | undefined> {
+  const row = await db()
+    .prepare("SELECT * FROM assets WHERE id = $1")
+    .get(id);
   return row ? assetRow(row) : undefined;
 }
 
-export function upsertAsset(input: {
+export async function upsertAsset(input: {
   companyId: number | null;
   kind: AssetKind;
   value: string;
   parentId?: number | null;
   attributes?: Record<string, unknown>;
-}): { asset: Asset; created: boolean } {
+}): Promise<{ asset: Asset; created: boolean }> {
   const value = input.value.trim();
   const parentId = input.parentId ?? null;
   const dedupKey = `${input.kind}:${value.toLowerCase()}@${parentId ?? "root"}`;
-  const existing = db()
-    .prepare("SELECT * FROM assets WHERE dedup_key = ?")
+  const existing = await db()
+    .prepare("SELECT * FROM assets WHERE dedup_key = $1")
     .get(dedupKey);
   if (existing) return { asset: assetRow(existing), created: false };
 
-  const info = db()
+  const info = await db()
     .prepare(
       `INSERT INTO assets (company_id, kind, value, parent_id, dedup_key, attributes, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
     )
     .run(
       input.companyId,
@@ -121,38 +133,41 @@ export function upsertAsset(input: {
       input.attributes ? JSON.stringify(input.attributes) : null,
       now(),
     );
-  return { asset: getAsset(Number(info.lastInsertRowid))!, created: true };
+  return { asset: (await getAsset(info.lastInsertRowid))!, created: true };
 }
 
-export function assetChildren(id: number): Asset[] {
-  return (
-    db().prepare("SELECT * FROM assets WHERE parent_id = ? ORDER BY kind, value").all(id) as unknown[]
-  ).map(assetRow);
+export async function assetChildren(id: number): Promise<Asset[]> {
+  const rows = await db()
+    .prepare("SELECT * FROM assets WHERE parent_id = $1 ORDER BY kind, value")
+    .all(id);
+  return rows.map(assetRow);
 }
 
 /* ------------------------------------------------------------------ */
 /* Task scope                                                          */
 /* ------------------------------------------------------------------ */
 
-export function addTaskScope(taskId: number, assetIds: number[]): void {
-  const stmt = db().prepare(
-    "INSERT OR IGNORE INTO task_scope (task_id, asset_id) VALUES (?, ?)",
-  );
-  const tx = db().transaction((ids: number[]) => {
-    for (const id of ids) stmt.run(taskId, id);
+export async function addTaskScope(taskId: number, assetIds: number[]): Promise<void> {
+  await db().transaction(async (client: TransactionClient) => {
+    for (const id of assetIds) {
+      await client
+        .prepare(
+          "INSERT INTO task_scope (task_id, asset_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+        )
+        .run(taskId, id);
+    }
   });
-  tx(assetIds);
 }
 
-export function listScopeAssets(taskId: number): Asset[] {
-  const rows = db()
+export async function listScopeAssets(taskId: number): Promise<Asset[]> {
+  const rows = await db()
     .prepare(
       `SELECT a.* FROM assets a
        JOIN task_scope s ON s.asset_id = a.id
-       WHERE s.task_id = ?
+       WHERE s.task_id = $1
        ORDER BY a.kind, a.value`,
     )
-    .all(taskId) as unknown[];
+    .all(taskId);
   return rows.map(assetRow);
 }
 
@@ -161,22 +176,30 @@ export function listScopeAssets(taskId: number): Asset[] {
 /* ------------------------------------------------------------------ */
 
 function taskRow(row: unknown): Task {
-  const r = row as Task & { todolist: string | null };
-  return { ...r, todolist: parseJson<TodoItem[] | null>(r.todolist, null) };
+  const r = row as unknown as Task & { todolist: string | null; auto_approve: boolean | number };
+  return {
+    ...r,
+    todolist: parseJson<TodoItem[] | null>(r.todolist, null),
+    auto_approve:
+      Boolean(r.auto_approve) ? 1 : 0,
+  };
 }
 
-export function listTasks(): Task[] {
-  return (
-    db().prepare("SELECT * FROM tasks ORDER BY created_at DESC").all() as unknown[]
-  ).map(taskRow);
+export async function listTasks(): Promise<Task[]> {
+  const rows = await db()
+    .prepare("SELECT * FROM tasks ORDER BY created_at DESC")
+    .all();
+  return (rows as unknown[]).map(taskRow);
 }
 
-export function getTask(id: number): Task | undefined {
-  const row = db().prepare("SELECT * FROM tasks WHERE id = ?").get(id);
+export async function getTask(id: number): Promise<Task | undefined> {
+  const row = await db()
+    .prepare("SELECT * FROM tasks WHERE id = $1")
+    .get(id);
   return row ? taskRow(row) : undefined;
 }
 
-export function createTask(input: {
+export async function createTask(input: {
   name: string;
   target: string;
   description?: string;
@@ -184,11 +207,11 @@ export function createTask(input: {
   language?: Language;
   concurrency?: number;
   autoApprove?: boolean;
-}): Task {
-  const info = db()
+}): Promise<Task> {
+  const info = await db()
     .prepare(
       `INSERT INTO tasks (name, target, description, goal, status, language, concurrency, auto_approve, created_at, updated_at)
-       VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)`,
+       VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7, $8, $9) RETURNING id`,
     )
     .run(
       input.name,
@@ -197,14 +220,14 @@ export function createTask(input: {
       input.goal ?? null,
       input.language ?? "en",
       input.concurrency ?? 3,
-      input.autoApprove === false ? 0 : 1,
+      input.autoApprove !== false,
       now(),
       now(),
     );
-  return getTask(Number(info.lastInsertRowid))!;
+  return (await getTask(info.lastInsertRowid))!;
 }
 
-export function updateTask(id: number, patch: Partial<Task>): void {
+export async function updateTask(id: number, patch: Partial<Task>): Promise<void> {
   const fields: string[] = [];
   const params: unknown[] = [];
   const writable: (keyof Task)[] = [
@@ -222,42 +245,71 @@ export function updateTask(id: number, patch: Partial<Task>): void {
   ];
   for (const key of writable) {
     if (patch[key] !== undefined) {
-      fields.push(`${key} = ?`);
-      params.push(patch[key]);
+      fields.push(`${key} = $${params.length + 1}`);
+      let value: unknown = patch[key];
+      if (key === "auto_approve") value = value !== 0;
+      params.push(value);
     }
   }
   if (patch.todolist !== undefined) {
-    fields.push("todolist = ?");
+    fields.push(`todolist = $${params.length + 1}`);
     params.push(patch.todolist ? JSON.stringify(patch.todolist) : null);
   }
-  fields.push("updated_at = ?");
+  fields.push(`updated_at = $${params.length + 1}`);
   params.push(now());
   params.push(id);
-  db().prepare(`UPDATE tasks SET ${fields.join(", ")} WHERE id = ?`).run(...params);
+  await db()
+    .prepare(`UPDATE tasks SET ${fields.join(", ")} WHERE id = $${params.length}`)
+    .run(...params);
 }
 
-export function setTaskStatus(id: number, status: TaskStatus, error?: string): void {
+export async function setTaskStatus(
+  id: number,
+  status: TaskStatus,
+  error?: string,
+): Promise<void> {
   const extra: Partial<Task> = {};
-  if (status === "running") extra.started_at = getTask(id)?.started_at ?? now();
-  if (["completed", "failed", "stopped"].includes(status)) extra.finished_at = now();
-  updateTask(id, { status, error: error ?? null, ...extra });
+  if (status === "running") {
+    const current = await getTask(id);
+    extra.started_at = current?.started_at ?? now();
+  }
+  if (["completed", "failed", "stopped"].includes(status))
+    extra.finished_at = now();
+  await updateTask(id, { status, error: error ?? null, ...extra });
 }
 
-export function deleteTask(id: number): void {
-  const d = db();
-  d.transaction(() => {
-    d.prepare("DELETE FROM activity WHERE task_id = ?").run(id);
-    d.prepare("DELETE FROM traffic WHERE task_id = ?").run(id);
-    d.prepare("DELETE FROM approvals WHERE task_id = ?").run(id);
-    d.prepare("DELETE FROM findings WHERE task_id = ?").run(id);
-    d.prepare("DELETE FROM task_scope WHERE task_id = ?").run(id);
-    d.prepare(
-      "DELETE FROM exploration_anchors WHERE node_id IN (SELECT id FROM exploration_nodes WHERE task_id = ?)",
-    ).run(id);
-    d.prepare("DELETE FROM exploration_edges WHERE task_id = ?").run(id);
-    d.prepare("DELETE FROM exploration_nodes WHERE task_id = ?").run(id);
-    d.prepare("DELETE FROM tasks WHERE id = ?").run(id);
-  })();
+export async function deleteTask(id: number): Promise<void> {
+  await db().transaction(async (client: TransactionClient) => {
+    await client
+      .prepare("DELETE FROM activity WHERE task_id = $1")
+      .run(id);
+    await client
+      .prepare("DELETE FROM traffic WHERE task_id = $1")
+      .run(id);
+    await client
+      .prepare("DELETE FROM approvals WHERE task_id = $1")
+      .run(id);
+    await client
+      .prepare("DELETE FROM findings WHERE task_id = $1")
+      .run(id);
+    await client
+      .prepare("DELETE FROM task_scope WHERE task_id = $1")
+      .run(id);
+    await client
+      .prepare(
+        "DELETE FROM exploration_anchors WHERE node_id IN (SELECT id FROM exploration_nodes WHERE task_id = $1)",
+      )
+      .run(id);
+    await client
+      .prepare("DELETE FROM exploration_edges WHERE task_id = $1")
+      .run(id);
+    await client
+      .prepare("DELETE FROM exploration_nodes WHERE task_id = $1")
+      .run(id);
+    await client
+      .prepare("DELETE FROM tasks WHERE id = $1")
+      .run(id);
+  });
 }
 
 /* ------------------------------------------------------------------ */
@@ -265,22 +317,25 @@ export function deleteTask(id: number): void {
 /* ------------------------------------------------------------------ */
 
 function nodeRow(row: unknown): ExplorationNode {
-  const r = row as ExplorationNode & { data: string | null };
-  return { ...r, data: parseJson<Record<string, unknown> | null>(r.data, null) };
+  const r = row as unknown as ExplorationNode & { data: string | null };
+  return {
+    ...r,
+    data: parseJson<Record<string, unknown> | null>(r.data, null),
+  };
 }
 
-export function createNode(input: {
+export async function createNode(input: {
   taskId: number;
   kind: NodeKind;
   title: string;
   content?: string;
   status?: NodeStatus;
   data?: Record<string, unknown>;
-}): ExplorationNode {
-  const info = db()
+}): Promise<ExplorationNode> {
+  const info = await db()
     .prepare(
       `INSERT INTO exploration_nodes (task_id, kind, title, content, status, data, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
     )
     .run(
       input.taskId,
@@ -291,84 +346,102 @@ export function createNode(input: {
       input.data ? JSON.stringify(input.data) : null,
       now(),
     );
-  return getNode(Number(info.lastInsertRowid))!;
+  return (await getNode(info.lastInsertRowid))!;
 }
 
-export function getNode(id: number): ExplorationNode | undefined {
-  const row = db().prepare("SELECT * FROM exploration_nodes WHERE id = ?").get(id);
+export async function getNode(id: number): Promise<ExplorationNode | undefined> {
+  const row = await db()
+    .prepare("SELECT * FROM exploration_nodes WHERE id = $1")
+    .get(id);
   return row ? nodeRow(row) : undefined;
 }
 
-export function listNodes(
+export async function listNodes(
   taskId: number,
   kind?: NodeKind,
   limit = 500,
-): ExplorationNode[] {
+): Promise<ExplorationNode[]> {
   const rows = kind
-    ? db()
+    ? await db()
         .prepare(
-          "SELECT * FROM exploration_nodes WHERE task_id = ? AND kind = ? ORDER BY id DESC LIMIT ?",
+          "SELECT * FROM exploration_nodes WHERE task_id = $1 AND kind = $2 ORDER BY id DESC LIMIT $3",
         )
         .all(taskId, kind, limit)
-    : db()
+    : await db()
         .prepare(
-          "SELECT * FROM exploration_nodes WHERE task_id = ? ORDER BY id DESC LIMIT ?",
+          "SELECT * FROM exploration_nodes WHERE task_id = $1 ORDER BY id DESC LIMIT $2",
         )
         .all(taskId, limit);
   return (rows as unknown[]).map(nodeRow);
 }
 
-export function updateNodeStatus(id: number, status: NodeStatus): void {
-  db().prepare("UPDATE exploration_nodes SET status = ? WHERE id = ?").run(status, id);
+export async function updateNodeStatus(
+  id: number,
+  status: NodeStatus,
+): Promise<void> {
+  await db()
+    .prepare("UPDATE exploration_nodes SET status = $1 WHERE id = $2")
+    .run(status, id);
 }
 
-export function addEdge(
+export async function addEdge(
   taskId: number,
   fromId: number,
   toId: number,
   relation: EdgeRelation,
-): void {
-  db()
+): Promise<void> {
+  await db()
     .prepare(
-      "INSERT INTO exploration_edges (task_id, from_id, to_id, relation, created_at) VALUES (?, ?, ?, ?, ?)",
+      "INSERT INTO exploration_edges (task_id, from_id, to_id, relation, created_at) VALUES ($1, $2, $3, $4, $5)",
     )
     .run(taskId, fromId, toId, relation, now());
 }
 
-export function listEdges(taskId: number): ExplorationEdge[] {
+export async function listEdges(taskId: number): Promise<ExplorationEdge[]> {
   return db()
-    .prepare("SELECT * FROM exploration_edges WHERE task_id = ? ORDER BY id")
-    .all(taskId) as ExplorationEdge[];
+    .prepare("SELECT * FROM exploration_edges WHERE task_id = $1 ORDER BY id")
+    .all(taskId) as unknown as Promise<ExplorationEdge[]>;
 }
 
-export function addAnchor(nodeId: number, assetIds: number[]): void {
-  const stmt = db().prepare(
-    "INSERT OR IGNORE INTO exploration_anchors (node_id, asset_id) VALUES (?, ?)",
-  );
-  const tx = db().transaction((ids: number[]) => {
-    for (const id of ids) stmt.run(nodeId, id);
+export async function addAnchor(
+  nodeId: number,
+  assetIds: number[],
+): Promise<void> {
+  await db().transaction(async (client: TransactionClient) => {
+    for (const id of assetIds) {
+      await client
+        .prepare(
+          "INSERT INTO exploration_anchors (node_id, asset_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+        )
+        .run(nodeId, id);
+    }
   });
-  tx(assetIds);
 }
 
-export function listAnchoredAssetIds(nodeId: number): number[] {
-  const rows = db()
-    .prepare("SELECT asset_id FROM exploration_anchors WHERE node_id = ?")
+export async function listAnchoredAssetIds(
+  nodeId: number,
+): Promise<number[]> {
+  const rows = await db()
+    .prepare("SELECT asset_id FROM exploration_anchors WHERE node_id = $1")
     .all(nodeId) as { asset_id: number }[];
   return rows.map((r) => r.asset_id);
 }
 
-export function listNodeIdsForAsset(assetId: number): number[] {
-  const rows = db()
-    .prepare("SELECT node_id FROM exploration_anchors WHERE asset_id = ?")
+export async function listNodeIdsForAsset(
+  assetId: number,
+): Promise<number[]> {
+  const rows = await db()
+    .prepare("SELECT node_id FROM exploration_anchors WHERE asset_id = $1")
     .all(assetId) as { node_id: number }[];
   return rows.map((r) => r.node_id);
 }
 
-export function nodeKindCounts(taskId: number): Record<string, number> {
-  const rows = db()
+export async function nodeKindCounts(
+  taskId: number,
+): Promise<Record<string, number>> {
+  const rows = await db()
     .prepare(
-      "SELECT kind, COUNT(*) as n FROM exploration_nodes WHERE task_id = ? GROUP BY kind",
+      "SELECT kind, COUNT(*) as n FROM exploration_nodes WHERE task_id = $1 GROUP BY kind",
     )
     .all(taskId) as { kind: string; n: number }[];
   return Object.fromEntries(rows.map((r) => [r.kind, r.n]));
@@ -380,10 +453,13 @@ export function nodeKindCounts(taskId: number): Record<string, number> {
 
 function activityRow(row: unknown): ActivityRecord {
   const r = row as ActivityRecord & { data: string | null };
-  return { ...r, data: parseJson<Record<string, unknown> | null>(r.data, null) };
+  return {
+    ...r,
+    data: parseJson<Record<string, unknown> | null>(r.data, null),
+  };
 }
 
-export function addActivity(input: {
+export async function addActivity(input: {
   taskId: number;
   intentId?: number | null;
   step?: number | null;
@@ -392,11 +468,11 @@ export function addActivity(input: {
   title: string;
   content?: string;
   data?: Record<string, unknown>;
-}): ActivityRecord {
-  const info = db()
+}): Promise<ActivityRecord> {
+  const info = await db()
     .prepare(
       `INSERT INTO activity (task_id, intent_id, step, role, type, title, content, data, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
     )
     .run(
       input.taskId,
@@ -409,59 +485,69 @@ export function addActivity(input: {
       input.data ? JSON.stringify(input.data) : null,
       now(),
     );
-  const row = db().prepare("SELECT * FROM activity WHERE id = ?").get(Number(info.lastInsertRowid));
-  return activityRow(row);
+  const row = await db()
+    .prepare("SELECT * FROM activity WHERE id = $1")
+    .get(info.lastInsertRowid);
+  return activityRow(row as unknown);
 }
 
-export function listActivity(taskId: number, limit = 200): ActivityRecord[] {
-  const rows = db()
+export async function listActivity(
+  taskId: number,
+  limit = 200,
+): Promise<ActivityRecord[]> {
+  const rows = await db()
     .prepare(
-      "SELECT * FROM activity WHERE task_id = ? ORDER BY id DESC LIMIT ?",
+      "SELECT * FROM activity WHERE task_id = $1 ORDER BY id DESC LIMIT $2",
     )
     .all(taskId, limit);
   return (rows as unknown[]).map(activityRow).reverse();
 }
 
-export function listIntentActivity(intentId: number): ActivityRecord[] {
-  const rows = db()
-    .prepare("SELECT * FROM activity WHERE intent_id = ? ORDER BY step, id")
+export async function listIntentActivity(
+  intentId: number,
+): Promise<ActivityRecord[]> {
+  const rows = await db()
+    .prepare("SELECT * FROM activity WHERE intent_id = $1 ORDER BY step, id")
     .all(intentId);
   return (rows as unknown[]).map(activityRow);
 }
 
-export function searchWorkerTraces(
+export async function searchWorkerTraces(
   taskId: number,
   query: string,
   excludeIntentId?: number,
   limit = 40,
-): ActivityRecord[] {
+): Promise<ActivityRecord[]> {
   const like = `%${query}%`;
-  const rows = db()
+  const rows = await db()
     .prepare(
       `SELECT * FROM activity
-       WHERE task_id = ? AND intent_id IS NOT NULL AND intent_id != ?
-         AND (title LIKE ? OR content LIKE ?)
-       ORDER BY id DESC LIMIT ?`,
+       WHERE task_id = $1 AND intent_id IS NOT NULL AND intent_id != $2
+         AND (title LIKE $3 OR content LIKE $3)
+       ORDER BY id DESC LIMIT $4`,
     )
-    .all(taskId, excludeIntentId ?? -1, like, like, limit);
+    .all(taskId, excludeIntentId ?? -1, like, limit);
   return (rows as unknown[]).map(activityRow);
 }
 
-export function listWorkerIntentIds(taskId: number): { intent_id: number; steps: number }[] {
-  return db()
+export async function listWorkerIntentIds(
+  taskId: number,
+): Promise<{ intent_id: number; steps: number }[]> {
+  const rows = await db()
     .prepare(
       `SELECT intent_id, COUNT(*) as steps FROM activity
-       WHERE task_id = ? AND intent_id IS NOT NULL
+       WHERE task_id = $1 AND intent_id IS NOT NULL
        GROUP BY intent_id ORDER BY intent_id`,
     )
     .all(taskId) as { intent_id: number; steps: number }[];
+  return rows;
 }
 
 /* ------------------------------------------------------------------ */
 /* Findings                                                            */
 /* ------------------------------------------------------------------ */
 
-export function createFinding(input: {
+export async function createFinding(input: {
   taskId: number | null;
   assetId: number | null;
   nodeId: number | null;
@@ -469,11 +555,11 @@ export function createFinding(input: {
   severity: Severity;
   description?: string;
   evidence?: string;
-}): Finding {
-  const info = db()
+}): Promise<Finding> {
+  const info = await db()
     .prepare(
       `INSERT INTO findings (task_id, asset_id, node_id, title, severity, status, description, evidence, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)`,
+       VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7, $8, $9) RETURNING id`,
     )
     .run(
       input.taskId,
@@ -486,28 +572,35 @@ export function createFinding(input: {
       now(),
       now(),
     );
-  return db()
-    .prepare("SELECT * FROM findings WHERE id = ?")
-    .get(Number(info.lastInsertRowid)) as Finding;
+  const row = await db()
+    .prepare("SELECT * FROM findings WHERE id = $1")
+    .get(info.lastInsertRowid);
+  return row as unknown as Finding;
 }
 
-export function listFindings(taskId?: number): Finding[] {
-  return (
+export async function listFindings(
+  taskId?: number,
+): Promise<Finding[]> {
+  const rows =
     taskId
-      ? db()
-          .prepare("SELECT * FROM findings WHERE task_id = ? ORDER BY id DESC")
+      ? await db()
+          .prepare("SELECT * FROM findings WHERE task_id = $1 ORDER BY id DESC")
           .all(taskId)
-      : db().prepare("SELECT * FROM findings ORDER BY id DESC").all()
-  ) as Finding[];
+      : await db().prepare("SELECT * FROM findings ORDER BY id DESC").all();
+  return rows as unknown as Finding[];
 }
 
-export function getFinding(id: number): Finding | undefined {
-  return db().prepare("SELECT * FROM findings WHERE id = ?").get(id) as
-    | Finding
-    | undefined;
+export async function getFinding(id: number): Promise<Finding | undefined> {
+  const row = await db()
+    .prepare("SELECT * FROM findings WHERE id = $1")
+    .get(id);
+  return row as unknown as Finding | undefined;
 }
 
-export function updateFinding(id: number, patch: Partial<Finding>): void {
+export async function updateFinding(
+  id: number,
+  patch: Partial<Finding>,
+): Promise<void> {
   const allowed: (keyof Finding)[] = [
     "status",
     "disposition",
@@ -520,32 +613,35 @@ export function updateFinding(id: number, patch: Partial<Finding>): void {
   const params: unknown[] = [];
   for (const key of allowed) {
     if (patch[key] !== undefined) {
-      fields.push(`${key} = ?`);
+      fields.push(`${key} = $${params.length + 1}`);
       params.push(patch[key]);
     }
   }
   if (!fields.length) return;
-  fields.push("updated_at = ?");
-  params.push(now(), id);
-  db().prepare(`UPDATE findings SET ${fields.join(", ")} WHERE id = ?`).run(...params);
+  fields.push(`updated_at = $${params.length + 1}`);
+  params.push(now());
+  params.push(id);
+  await db()
+    .prepare(`UPDATE findings SET ${fields.join(", ")} WHERE id = $${params.length}`)
+    .run(...params);
 }
 
 /* ------------------------------------------------------------------ */
 /* Approvals                                                           */
 /* ------------------------------------------------------------------ */
 
-export function createApproval(input: {
+export async function createApproval(input: {
   taskId: number;
   intentId: number | null;
   tool: string;
   args: Record<string, unknown>;
   reason?: string;
   status: string;
-}): Approval {
-  const info = db()
+}): Promise<Approval> {
+  const info = await db()
     .prepare(
       `INSERT INTO approvals (task_id, intent_id, tool, args, reason, status, created_at, decided_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
     )
     .run(
       input.taskId,
@@ -557,39 +653,46 @@ export function createApproval(input: {
       now(),
       input.status === "pending" ? null : now(),
     );
-  return db()
-    .prepare("SELECT * FROM approvals WHERE id = ?")
-    .get(Number(info.lastInsertRowid)) as Approval;
+  const row = await db()
+    .prepare("SELECT * FROM approvals WHERE id = $1")
+    .get(info.lastInsertRowid);
+  return row as unknown as Approval;
 }
 
-export function listApprovals(taskId?: number): Approval[] {
-  return (
+export async function listApprovals(
+  taskId?: number,
+): Promise<Approval[]> {
+  const rows =
     taskId
-      ? db()
-          .prepare("SELECT * FROM approvals WHERE task_id = ? ORDER BY id DESC")
+      ? await db()
+          .prepare("SELECT * FROM approvals WHERE task_id = $1 ORDER BY id DESC")
           .all(taskId)
-      : db().prepare("SELECT * FROM approvals ORDER BY id DESC").all()
-  ) as Approval[];
+      : await db().prepare("SELECT * FROM approvals ORDER BY id DESC").all();
+  return rows as unknown as Approval[];
 }
 
-export function findDecidedApproval(
+export async function findDecidedApproval(
   taskId: number,
   intentId: number | null,
   tool: string,
-): Approval | undefined {
+): Promise<Approval | undefined> {
   if (intentId === null) return undefined;
-  return db()
+  const row = await db()
     .prepare(
       `SELECT * FROM approvals
-       WHERE task_id = ? AND intent_id = ? AND tool = ? AND status IN ('approved','auto_approved','denied')
+       WHERE task_id = $1 AND intent_id = $2 AND tool = $3 AND status IN ('approved','auto_approved','denied')
        ORDER BY id DESC LIMIT 1`,
     )
-    .get(taskId, intentId, tool) as Approval | undefined;
+    .get(taskId, intentId, tool);
+  return row as unknown as Approval | undefined;
 }
 
-export function setApprovalStatus(id: number, status: string): void {
-  db()
-    .prepare("UPDATE approvals SET status = ?, decided_at = ? WHERE id = ?")
+export async function setApprovalStatus(
+  id: number,
+  status: string,
+): Promise<void> {
+  await db()
+    .prepare("UPDATE approvals SET status = $1, decided_at = $2 WHERE id = $3")
     .run(status, now(), id);
 }
 
@@ -597,7 +700,7 @@ export function setApprovalStatus(id: number, status: string): void {
 /* Traffic                                                             */
 /* ------------------------------------------------------------------ */
 
-export function addTraffic(input: {
+export async function addTraffic(input: {
   taskId: number;
   intentId: number | null;
   method: string;
@@ -605,11 +708,11 @@ export function addTraffic(input: {
   status: number | null;
   request?: string;
   response?: string;
-}): void {
-  db()
+}): Promise<void> {
+  await db()
     .prepare(
       `INSERT INTO traffic (task_id, intent_id, method, url, status, request, response, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
     )
     .run(
       input.taskId,
@@ -623,41 +726,63 @@ export function addTraffic(input: {
     );
 }
 
-export function listTraffic(taskId?: number, limit = 200): TrafficRecord[] {
-  return (
+export async function listTraffic(
+  taskId?: number,
+  limit = 200,
+): Promise<TrafficRecord[]> {
+  const rows =
     taskId
-      ? db()
-          .prepare("SELECT * FROM traffic WHERE task_id = ? ORDER BY id DESC LIMIT ?")
+      ? await db()
+          .prepare(
+            "SELECT * FROM traffic WHERE task_id = $1 ORDER BY id DESC LIMIT $2",
+          )
           .all(taskId, limit)
-      : db()
-          .prepare("SELECT * FROM traffic ORDER BY id DESC LIMIT ?")
-          .all(limit)
-  ) as TrafficRecord[];
+      : await db()
+          .prepare("SELECT * FROM traffic ORDER BY id DESC LIMIT $1")
+          .all(limit);
+  return rows as unknown as TrafficRecord[];
 }
 
 /* ------------------------------------------------------------------ */
 /* LLM configuration                                                   */
 /* ------------------------------------------------------------------ */
 
-export function listLlmConfigs(): LlmConfig[] {
-  return db()
+export async function listLlmConfigs(): Promise<LlmConfig[]> {
+  const rows = await db()
     .prepare("SELECT * FROM llm_configs ORDER BY id")
-    .all() as LlmConfig[];
+    .all();
+  return (rows as unknown as (LlmConfig & { is_active: boolean | number })[]).map(normalizeLlmConfig);
 }
 
-export function getLlmConfig(id: number): LlmConfig | undefined {
-  return db().prepare("SELECT * FROM llm_configs WHERE id = ?").get(id) as
-    | LlmConfig
-    | undefined;
+export async function getLlmConfig(
+  id: number,
+): Promise<LlmConfig | undefined> {
+  const row = await db()
+    .prepare("SELECT * FROM llm_configs WHERE id = $1")
+    .get(id);
+  if (!row) return undefined;
+  return normalizeLlmConfig(row as unknown as LlmConfig & { is_active: boolean | number });
 }
 
-export function getActiveLlmConfig(): LlmConfig | undefined {
-  return db()
-    .prepare("SELECT * FROM llm_configs WHERE is_active = 1 ORDER BY id LIMIT 1")
-    .get() as LlmConfig | undefined;
+export async function getActiveLlmConfig(): Promise<LlmConfig | undefined> {
+  const row = await db()
+    .prepare("SELECT * FROM llm_configs WHERE is_active = true ORDER BY id LIMIT 1")
+    .get();
+  if (!row) return undefined;
+  return normalizeLlmConfig(row as unknown as LlmConfig & { is_active: boolean | number });
 }
 
-export function createLlmConfig(input: {
+function normalizeLlmConfig(
+  row: LlmConfig & { is_active: boolean | number },
+): LlmConfig {
+  return {
+    ...row,
+    is_active:
+      Boolean(row.is_active) ? 1 : 0,
+  };
+}
+
+export async function createLlmConfig(input: {
   name: string;
   provider: LlmConfig["provider"];
   model: string;
@@ -665,12 +790,11 @@ export function createLlmConfig(input: {
   apiKey?: string;
   temperature?: number;
   activate?: boolean;
-}): LlmConfig {
-  const d = db();
-  const info = d
+}): Promise<LlmConfig> {
+  const info = await db()
     .prepare(
       `INSERT INTO llm_configs (name, provider, model, base_url, api_key, temperature, is_active, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, 0, ?)`,
+       VALUES ($1, $2, $3, $4, $5, $6, false, $7) RETURNING id`,
     )
     .run(
       input.name,
@@ -681,28 +805,34 @@ export function createLlmConfig(input: {
       input.temperature ?? null,
       now(),
     );
-  const id = Number(info.lastInsertRowid);
-  if (input.activate) setActiveLlmConfig(id);
-  return getLlmConfig(id)!;
+  const id = info.lastInsertRowid;
+  const config = (await getLlmConfig(id))!;
+  if (input.activate) await setActiveLlmConfig(id);
+  return config;
 }
 
-export function setActiveLlmConfig(id: number): void {
-  const d = db();
-  d.transaction(() => {
-    d.prepare("UPDATE llm_configs SET is_active = 0").run();
-    d.prepare("UPDATE llm_configs SET is_active = 1 WHERE id = ?").run(id);
-  })();
+export async function setActiveLlmConfig(id: number): Promise<void> {
+  await db().transaction(async (client: TransactionClient) => {
+    await client
+      .prepare("UPDATE llm_configs SET is_active = false")
+      .run();
+    await client
+      .prepare("UPDATE llm_configs SET is_active = true WHERE id = $1")
+      .run(id);
+  });
 }
 
-export function deleteLlmConfig(id: number): void {
-  db().prepare("DELETE FROM llm_configs WHERE id = ?").run(id);
+export async function deleteLlmConfig(id: number): Promise<void> {
+  await db()
+    .prepare("DELETE FROM llm_configs WHERE id = $1")
+    .run(id);
 }
 
 /* ------------------------------------------------------------------ */
 /* LLM usage                                                           */
 /* ------------------------------------------------------------------ */
 
-export function recordUsage(input: {
+export async function recordUsage(input: {
   taskId: number | null;
   role: string;
   provider: string;
@@ -712,18 +842,18 @@ export function recordUsage(input: {
   outputTokens: number;
   cacheReadTokens: number;
   cacheWriteTokens: number;
-}): void {
-  db()
+}): Promise<void> {
+  await db()
     .prepare(
       `INSERT INTO llm_usage (task_id, role, provider, model, live, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
     )
     .run(
       input.taskId,
       input.role,
       input.provider,
       input.model,
-      input.live ? 1 : 0,
+      input.live,
       input.inputTokens,
       input.outputTokens,
       input.cacheReadTokens,
@@ -746,23 +876,33 @@ export interface UsageRow {
   created_at: string;
 }
 
-export function listUsage(limit = 200): UsageRow[] {
-  return db()
-    .prepare("SELECT * FROM llm_usage ORDER BY id DESC LIMIT ?")
-    .all(limit) as UsageRow[];
+export async function listUsage(limit = 200): Promise<UsageRow[]> {
+  const rows = await db()
+    .prepare("SELECT * FROM llm_usage ORDER BY id DESC LIMIT $1")
+    .all(limit) as unknown as UsageRow[];
+  return rows.map(normalizeUsageRow);
 }
 
-export function usageByModel(): Array<{
-  model: string;
-  provider: string;
-  live: number;
-  runs: number;
-  input: number;
-  output: number;
-  cacheRead: number;
-  total: number;
-}> {
-  const rows = db()
+function normalizeUsageRow(row: UsageRow): UsageRow {
+  return {
+    ...row,
+    live: Boolean(row.live) ? 1 : 0,
+  };
+}
+
+export async function usageByModel(): Promise<
+  Array<{
+    model: string;
+    provider: string;
+    live: number;
+    runs: number;
+    input: number;
+    output: number;
+    cacheRead: number;
+    total: number;
+  }>
+> {
+  const rows = await db()
     .prepare(
       `SELECT model, provider, MAX(live) as live, COUNT(*) as runs,
               SUM(input_tokens) as input, SUM(output_tokens) as output,
@@ -773,18 +913,27 @@ export function usageByModel(): Array<{
     .all() as Array<{
     model: string;
     provider: string;
-    live: number;
+    live: boolean | number;
     runs: number;
     input: number;
     output: number;
     cacheRead: number;
     total: number;
   }>;
-  return rows;
+  return rows.map((r) => ({
+    model: r.model,
+    provider: r.provider,
+    live: Boolean(r.live) ? 1 : 0,
+    runs: r.runs,
+    input: r.input,
+    output: r.output,
+    cacheRead: r.cacheRead,
+    total: r.total,
+  }));
 }
 
-export function usageTotals(model?: string) {
-  const row = db()
+export async function usageTotals(model?: string) {
+  const row = await db()
     .prepare(
       `SELECT COUNT(*) as runs,
               COUNT(DISTINCT task_id) as tasks,
@@ -793,7 +942,7 @@ export function usageTotals(model?: string) {
               COALESCE(SUM(cache_read_tokens), 0) as cacheRead,
               COALESCE(SUM(cache_write_tokens), 0) as cacheWrite,
               COALESCE(SUM(input_tokens + output_tokens + cache_read_tokens), 0) as total
-       FROM llm_usage${model ? " WHERE model = ?" : ""}`,
+       FROM llm_usage${model ? " WHERE model = $1" : ""}`,
     )
     .get(...(model ? [model] : [])) as {
     runs: number;
@@ -807,16 +956,23 @@ export function usageTotals(model?: string) {
   return row;
 }
 
-export function usageSeries(sinceIso: string, bucket: "day" | "month", model?: string) {
-  const key = bucket === "day" ? "substr(created_at, 1, 10)" : "substr(created_at, 1, 7)";
-  const filter = model ? "AND model = ?" : "";
-  return db()
+export async function usageSeries(
+  sinceIso: string,
+  bucket: "day" | "month",
+  model?: string,
+) {
+  const key =
+    bucket === "day"
+      ? "to_char(created_at, 'YYYY-MM-DD')"
+      : "to_char(created_at, 'YYYY-MM')";
+  const filter = model ? "AND model = $2" : "";
+  const rows = await db()
     .prepare(
       `SELECT ${key} as bucket,
               COALESCE(SUM(input_tokens), 0) as input,
               COALESCE(SUM(output_tokens), 0) as output,
               COALESCE(SUM(cache_read_tokens), 0) as cacheRead
-       FROM llm_usage WHERE created_at >= ? ${filter}
+       FROM llm_usage WHERE created_at >= $1 ${filter}
        GROUP BY bucket ORDER BY bucket`,
     )
     .all(sinceIso, ...(model ? [model] : [])) as Array<{
@@ -825,42 +981,74 @@ export function usageSeries(sinceIso: string, bucket: "day" | "month", model?: s
     output: number;
     cacheRead: number;
   }>;
+  return rows;
 }
 
 /* ------------------------------------------------------------------ */
 /* System settings                                                     */
 /* ------------------------------------------------------------------ */
 
-export function getSystemSettings() {
+export async function getSystemSettings() {
+  const [language, autoApprove, concurrency, plannerMaxSteps, workerMaxSteps, traceSearchLimit] =
+    await Promise.all([
+      getSetting("language"),
+      getSetting("auto_approve"),
+      getSetting("concurrency"),
+      getSetting("planner_max_steps"),
+      getSetting("worker_max_steps"),
+      getSetting("trace_search_limit"),
+    ]);
   return {
-    language: getSetting("language") ?? "en",
-    autoApprove: (getSetting("auto_approve") ?? "1") === "1",
-    concurrency: Number(getSetting("concurrency") ?? "3"),
-    plannerMaxSteps: Number(getSetting("planner_max_steps") ?? "8"),
-    workerMaxSteps: Number(getSetting("worker_max_steps") ?? "12"),
-    traceSearchLimit: Number(getSetting("trace_search_limit") ?? "40"),
+    language: language ?? "en",
+    autoApprove: (autoApprove ?? "1") === "1",
+    concurrency: Number(concurrency ?? "3"),
+    plannerMaxSteps: Number(plannerMaxSteps ?? "8"),
+    workerMaxSteps: Number(workerMaxSteps ?? "12"),
+    traceSearchLimit: Number(traceSearchLimit ?? "40"),
   };
 }
 
-export function updateSystemSettings(patch: {
+export async function updateSystemSettings(patch: {
   language?: string;
   autoApprove?: boolean;
   concurrency?: number;
   plannerMaxSteps?: number;
   workerMaxSteps?: number;
   traceSearchLimit?: number;
-}): void {
-  if (patch.language !== undefined) setSetting("language", patch.language);
+}): Promise<void> {
+  const updates: Array<Promise<void>> = [];
+  if (patch.language !== undefined)
+    updates.push(setSetting("language", patch.language));
   if (patch.autoApprove !== undefined)
-    setSetting("auto_approve", patch.autoApprove ? "1" : "0");
+    updates.push(
+      setSetting("auto_approve", patch.autoApprove ? "1" : "0"),
+    );
   if (patch.concurrency !== undefined)
-    setSetting("concurrency", String(clamp(patch.concurrency, 1, 10)));
+    updates.push(
+      setSetting("concurrency", String(clamp(patch.concurrency, 1, 10))),
+    );
   if (patch.plannerMaxSteps !== undefined)
-    setSetting("planner_max_steps", String(clamp(patch.plannerMaxSteps, 1, 30)));
+    updates.push(
+      setSetting(
+        "planner_max_steps",
+        String(clamp(patch.plannerMaxSteps, 1, 30)),
+      ),
+    );
   if (patch.workerMaxSteps !== undefined)
-    setSetting("worker_max_steps", String(clamp(patch.workerMaxSteps, 1, 40)));
+    updates.push(
+      setSetting(
+        "worker_max_steps",
+        String(clamp(patch.workerMaxSteps, 1, 40)),
+      ),
+    );
   if (patch.traceSearchLimit !== undefined)
-    setSetting("trace_search_limit", String(clamp(patch.traceSearchLimit, 1, 200)));
+    updates.push(
+      setSetting(
+        "trace_search_limit",
+        String(clamp(patch.traceSearchLimit, 1, 200)),
+      ),
+    );
+  await Promise.all(updates);
 }
 
 function clamp(value: number, min: number, max: number): number {

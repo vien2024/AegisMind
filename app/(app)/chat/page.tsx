@@ -14,7 +14,7 @@ export default async function ChatPage({
 }) {
   await requirePageUser();
   const params = await searchParams;
-  const tasks = repo.listTasks();
+  const tasks = await repo.listTasks();
   const selected = params.taskId ? tasks.find((task) => task.id === Number(params.taskId)) : undefined;
 
   return (

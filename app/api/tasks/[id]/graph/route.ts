@@ -10,15 +10,15 @@ export async function GET(_request: Request, { params }: Params) {
   const denied = await unauthorized();
   if (denied) return denied;
   const id = Number((await params).id);
-  const task = repo.getTask(id);
+  const task = await repo.getTask(id);
   if (!task) return Response.json({ error: "not found" }, { status: 404 });
-  const graph = taskGraph(id);
+  const graph = await taskGraph(id);
   return Response.json({
     task,
-    counts: repo.nodeKindCounts(id),
+    counts: await repo.nodeKindCounts(id),
     nodes: graph.nodes,
     edges: graph.edges,
     anchors: graph.anchors,
-    coverage: coverageReport(id),
+    coverage: await coverageReport(id),
   });
 }

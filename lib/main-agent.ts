@@ -13,8 +13,8 @@ everything is covered.
 Be concise. Cite the intent/finding ids you used. This edition explores a local, offline simulation;
 never claim to have contacted a real system, and never instruct the operator to attack one.`;
 
-export function buildMainAgent(taskId: number) {
-  const task = repo.getTask(taskId);
+export async function buildMainAgent(taskId: number) {
+  const task = await repo.getTask(taskId);
   if (!task) throw new Error(`task ${taskId} not found`);
 
   const tools = {
@@ -32,7 +32,7 @@ export function buildMainAgent(taskId: number) {
       description: "List the findings recorded for this task.",
       inputSchema: z.object({}),
       execute: async () =>
-        repo.listFindings(taskId).map((f) => ({
+        (await repo.listFindings(taskId)).map((f) => ({
           id: f.id,
           title: f.title,
           severity: f.severity,
@@ -44,7 +44,7 @@ export function buildMainAgent(taskId: number) {
       description: "List the most recent activity records (worker traces) for this task.",
       inputSchema: z.object({ limit: z.number().optional() }),
       execute: async ({ limit }) =>
-        repo.listActivity(taskId, Math.min(limit ?? 40, 200)).map((a) => ({
+        (await repo.listActivity(taskId, Math.min(limit ?? 40, 200))).map((a) => ({
           id: a.id,
           role: a.role,
           type: a.type,
@@ -59,7 +59,7 @@ export function buildMainAgent(taskId: number) {
         asset_ids: z.array(z.number()).min(1),
       }),
       execute: async ({ title, description, asset_ids }) => {
-        const node = repo.createNode({
+        const node = await repo.createNode({
           taskId,
           kind: "intent",
           title,
@@ -67,13 +67,13 @@ export function buildMainAgent(taskId: number) {
           status: "pending",
           data: { source: "mainagent" },
         });
-        repo.addAnchor(node.id, asset_ids);
+        await repo.addAnchor(node.id, asset_ids);
         return { intent_id: node.id };
       },
     }),
   };
 
-  const resolved = resolveModel({
+  const resolved = await resolveModel({
     modelId: "aegismind-chat-sim",
     script: () => ({
       type: "text",

@@ -19,16 +19,17 @@ export async function GET(request: Request) {
   const since = new Date(Date.now() - range.days * 24 * 60 * 60 * 1000).toISOString();
 
   const model = url.searchParams.get("model") ?? undefined;
-  const totals = repo.usageTotals(model);
+  const totals = await repo.usageTotals(model);
   return Response.json({
     range: range.bucket,
     since,
     totals: {
       ...totals,
-      cacheHitRate: totals.total > 0 ? Math.round((totals.cacheRead / totals.total) * 100) : 0,
+      cacheHitRate:
+        totals.total > 0 ? Math.round((totals.cacheRead / totals.total) * 100) : 0,
     },
-    byModel: repo.usageByModel(),
-    series: repo.usageSeries(since, range.bucket, model),
+    byModel: await repo.usageByModel(),
+    series: await repo.usageSeries(since, range.bucket, model),
     model: model ?? null,
   });
 }

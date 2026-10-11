@@ -8,15 +8,18 @@ export async function GET(request: Request) {
   const denied = await unauthorized();
   if (denied) return denied;
   const taskId = new URL(request.url).searchParams.get("taskId");
-  const findings = repo.listFindings(taskId ? Number(taskId) : undefined);
-  const tasks = repo.listTasks();
-  return Response.json({
-    findings: findings.map((f) => ({
+  const findings = await repo.listFindings(taskId ? Number(taskId) : undefined);
+  const tasks = await repo.listTasks();
+
+  const enriched = await Promise.all(
+    findings.map(async (f) => ({
       ...f,
       task_name: tasks.find((t) => t.id === f.task_id)?.name ?? null,
-      asset_value: f.asset_id ? repo.getAsset(f.asset_id)?.value ?? null : null,
+      asset_value: f.asset_id ? (await repo.getAsset(f.asset_id))?.value ?? null : null,
     })),
-  });
+  );
+
+  return Response.json({ findings: enriched });
 }
 
 export async function POST(request: Request) {
@@ -30,10 +33,11 @@ export async function POST(request: Request) {
     evidence?: string;
   };
   if (!body.title?.trim()) return badRequest("title is required");
-  const severity: Severity = SEVERITIES.includes(body.severity as Severity)
-    ? (body.severity as Severity)
-    : "info";
-  const finding = repo.createFinding({
+  const severity: Severity =
+    SEVERITIES.includes(body.severity as Severity)
+      ? (body.severity as Severity)
+      : "info";
+  const finding = await repo.createFinding({
     taskId: body.taskId ?? null,
     assetId: null,
     nodeId: null,

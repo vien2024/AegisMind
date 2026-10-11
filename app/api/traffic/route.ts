@@ -9,5 +9,7 @@ export async function GET(request: Request) {
   const url = new URL(request.url);
   const taskId = url.searchParams.get("taskId");
   const limit = Number(url.searchParams.get("limit") ?? "200");
-  return Response.json({ traffic: repo.listTraffic(taskId ? Number(taskId) : undefined, Math.min(limit, 1000)) });
+  return Response.json({
+    traffic: await repo.listTraffic(taskId ? Number(taskId) : undefined, Math.min(limit, 1000)),
+  });
 }

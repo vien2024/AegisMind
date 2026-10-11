@@ -7,13 +7,13 @@ export async function GET(request: Request, { params }: Params) {
   const denied = await unauthorized();
   if (denied) return denied;
   const id = Number((await params).id);
-  const task = repo.getTask(id);
+  const task = await repo.getTask(id);
   if (!task) return Response.json({ error: "not found" }, { status: 404 });
 
-  const findings = repo.listFindings(id);
-  const nodes = repo.listNodes(id, undefined, 2000);
-  const edges = repo.listEdges(id);
-  const activity = repo.listActivity(id, 1000);
+  const findings = await repo.listFindings(id);
+  const nodes = await repo.listNodes(id, undefined, 2000);
+  const edges = await repo.listEdges(id);
+  const activity = await repo.listActivity(id, 1000);
 
   const format = new URL(request.url).searchParams.get("format") ?? "md";
 

@@ -70,8 +70,8 @@ Rules:
 /* Prompt builders                                                     */
 /* ------------------------------------------------------------------ */
 
-function scopeSummary(taskId: number): string {
-  const scope = repo.listScopeAssets(taskId);
+async function scopeSummary(taskId: number): Promise<string> {
+  const scope = await repo.listScopeAssets(taskId);
   if (!scope.length) return "(no in-scope assets yet)";
   return scope.map((a) => `- ${a.kind} ${a.value} (asset_id=${a.id})`).join("\n");
 }
@@ -83,21 +83,21 @@ function plannerPrompt(task: Task): string {
     task.goal ? `Goal: ${task.goal}` : "Goal: determine the attack surface and record any findings.",
     "",
     "In-scope assets:",
-    scopeSummary(task.id),
+    "(in-scope assets loaded at wake time)",
     "",
     "Decide the next move. Remember: most wakes should send zero intents.",
   ].join("\n");
 }
 
-function workerPrompt(task: Task, intentId: number): string {
-  const intent = repo.getNode(intentId);
+async function workerPrompt(task: Task, intentId: number): Promise<string> {
+  const intent = await repo.getNode(intentId);
   return [
     `Task: ${task.name} (target ${task.target})`,
     `Your intent #${intentId}: ${intent?.title ?? "(unknown)"}`,
     intent?.content ? `Details: ${intent.content}` : "",
     "",
     "In-scope assets:",
-    scopeSummary(task.id),
+    "(in-scope assets loaded at wake time)",
     "",
     "Execute this one intent, write your observations back to both graphs, then finish_intent.",
   ]
@@ -109,9 +109,9 @@ function workerPrompt(task: Task, intentId: number): string {
 /* Offline (mock) scripts                                              */
 /* ------------------------------------------------------------------ */
 
-export function plannerScript(taskId: number): MockStep[] {
-  const overview = graphOverview(taskId);
-  const coverage = coverageSnapshot(taskId);
+export async function plannerScript(taskId: number): Promise<MockStep[]> {
+  const overview = await graphOverview(taskId);
+  const coverage = await coverageSnapshot(taskId);
   const steps: MockStep[] = [
     { type: "tool", toolName: "get_graph_overview", input: {} },
     { type: "tool", toolName: "get_coverage", input: {} },
@@ -140,7 +140,7 @@ export function plannerScript(taskId: number): MockStep[] {
   }
 
   const target = untested[0]!;
-  const asset = repo.getAsset(target.id)!;
+  const asset: import("./types").Asset = (await repo.getAsset(target.id))!;
   const technique = techniqueFor(asset, taskId);
   steps.push({
     type: "tool",
@@ -154,15 +154,15 @@ export function plannerScript(taskId: number): MockStep[] {
   return steps;
 }
 
-export function workerScript(taskId: number, intentId: number): MockStep[] {
-  const anchored = repo.listAnchoredAssetIds(intentId);
+export async function workerScript(taskId: number, intentId: number): Promise<MockStep[]> {
+  const anchored = await repo.listAnchoredAssetIds(intentId);
   const assetId = anchored[0];
   const steps: MockStep[] = [{ type: "tool", toolName: "get_intent_context", input: {} }];
   if (assetId === undefined) {
     steps.push({ type: "tool", toolName: "finish_intent", input: { summary: "Intent had no anchored asset; nothing to do." } });
     return steps;
   }
-  const asset = repo.getAsset(assetId);
+  const asset = await repo.getAsset(assetId);
   if (!asset) {
     steps.push({ type: "tool", toolName: "finish_intent", input: { summary: "Anchored asset no longer exists." } });
     return steps;
@@ -180,9 +180,9 @@ export function workerScript(taskId: number, intentId: number): MockStep[] {
   // If the interception gate is on and no decision exists yet, the run_recon call above will be
   // held. Stop here so the intent stays "awaiting_approval" and the engine pauses instead of
   // finishing an intent that never actually ran.
-  const task = repo.getTask(taskId);
+  const task = await repo.getTask(taskId);
   const requiresApproval = task ? task.auto_approve !== 1 : false;
-  const decided = repo.findDecidedApproval(taskId, intentId, "run_recon");
+  const decided = await repo.findDecidedApproval(taskId, intentId, "run_recon");
   if (requiresApproval && !decided) {
     steps.push({ type: "text", text: "Reconnaissance is held by the interception gate." });
     return steps;
@@ -233,15 +233,17 @@ export function workerScript(taskId: number, intentId: number): MockStep[] {
 /* Turns                                                               */
 /* ------------------------------------------------------------------ */
 
-export async function runPlannerTurn(taskId: number): Promise<{ proved: boolean; live: boolean; provider: string }> {
-  const task = repo.getTask(taskId);
+export async function runPlannerTurn(
+  taskId: number,
+): Promise<{ proved: boolean; live: boolean; provider: string }> {
+  const task = await repo.getTask(taskId);
   if (!task) return { proved: false, live: false, provider: "none" };
 
   const ctx: RunContext = { task, role: "planner" };
   const tools = buildPlannerTools(ctx) as unknown as ToolSet;
-  const settings = repo.getSystemSettings();
-  const resolved = resolveModel({
-    script: plannerScript(taskId),
+  const settings = await repo.getSystemSettings();
+  const resolved = await resolveModel({
+    script: await plannerScript(taskId),
     modelId: "aegismind-planner-sim",
   });
 
@@ -253,13 +255,13 @@ export async function runPlannerTurn(taskId: number): Promise<{ proved: boolean;
     stopWhen: stepCountIs(settings.plannerMaxSteps),
   });
 
-  repo.addActivity({ taskId, role: "planner", type: "wake", title: "planner wake" });
-  const goalBefore = repo.listNodes(taskId, "goal", 1)[0];
+  await repo.addActivity({ taskId, role: "planner", type: "wake", title: "planner wake" });
+  const goalBefore = (await repo.listNodes(taskId, "goal", 1))[0];
   const result = await agent.generate({ prompt: plannerPrompt(task) });
-  recordUsage(taskId, "planner", resolved, result.usage);
-  const goalAfter = repo.listNodes(taskId, "goal", 1)[0];
+  await recordUsage(taskId, "planner", resolved, result.usage);
+  const goalAfter = (await repo.listNodes(taskId, "goal", 1))[0];
 
-  repo.addActivity({
+  await repo.addActivity({
     taskId,
     role: "planner",
     type: "message",
@@ -280,15 +282,15 @@ export async function runWorkerTurn(
   intentId: number,
   workerIndex: number,
 ): Promise<void> {
-  const task = repo.getTask(taskId);
+  const task = await repo.getTask(taskId);
   if (!task) return;
 
-  repo.updateNodeStatus(intentId, "running");
+  await repo.updateNodeStatus(intentId, "running");
   const ctx: RunContext = { task, role: "worker", intentId, workerIndex };
   const tools = buildWorkerTools(ctx) as unknown as ToolSet;
-  const settings = repo.getSystemSettings();
-  const resolved = resolveModel({
-    script: workerScript(taskId, intentId),
+  const settings = await repo.getSystemSettings();
+  const resolved = await resolveModel({
+    script: await workerScript(taskId, intentId),
     modelId: `aegismind-worker-sim`,
   });
 
@@ -301,9 +303,9 @@ export async function runWorkerTurn(
   });
 
   try {
-    const result = await agent.generate({ prompt: workerPrompt(task, intentId) });
-    recordUsage(taskId, `worker#${workerIndex}`, resolved, result.usage);
-    repo.addActivity({
+    const result = await agent.generate({ prompt: await workerPrompt(task, intentId) });
+    await recordUsage(taskId, `worker#${workerIndex}`, resolved, result.usage);
+    await repo.addActivity({
       taskId,
       intentId,
       role: `worker#${workerIndex}`,
@@ -313,7 +315,7 @@ export async function runWorkerTurn(
       data: { steps: result.steps.length, provider: resolved.provider, live: resolved.live },
     });
   } catch (error) {
-    repo.addActivity({
+    await repo.addActivity({
       taskId,
       intentId,
       role: `worker#${workerIndex}`,
@@ -322,9 +324,9 @@ export async function runWorkerTurn(
       content: error instanceof Error ? error.message : String(error),
     });
   } finally {
-    const current = repo.getNode(intentId);
+    const current = await repo.getNode(intentId);
     if (current && ["running", "pending"].includes(current.status)) {
-      repo.updateNodeStatus(intentId, "done");
+      await repo.updateNodeStatus(intentId, "done");
     }
   }
 }

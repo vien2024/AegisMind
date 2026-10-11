@@ -15,15 +15,13 @@ export default async function SearchPage({
   const query = (q ?? "").trim().toLowerCase();
 
   const tasks = query
-    ? repo.listTasks().filter((task) => `${task.name} ${task.target} ${task.goal ?? ""}`.toLowerCase().includes(query))
+    ? (await repo.listTasks()).filter((task) => `${task.name} ${task.target} ${task.goal ?? ""}`.toLowerCase().includes(query))
     : [];
-  const assets = query ? repo.listAssets({ search: q }).slice(0, 40) : [];
-  const findings = query
-    ? repo
-        .listFindings()
-        .filter((finding) => `${finding.title} ${finding.description ?? ""} ${finding.evidence ?? ""}`.toLowerCase().includes(query))
-        .slice(0, 40)
-    : [];
+  const assets = query ? (await repo.listAssets({ search: q })).slice(0, 40) : [];
+  const rawFindings = query ? await repo.listFindings() : [];
+  const findings = rawFindings
+    .filter((finding) => `${finding.title} ${finding.description ?? ""} ${finding.evidence ?? ""}`.toLowerCase().includes(query))
+    .slice(0, 40);
 
   const total = tasks.length + assets.length + findings.length;
 

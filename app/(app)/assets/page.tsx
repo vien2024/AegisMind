@@ -13,12 +13,12 @@ export default async function AssetsPage({
   await requirePageUser();
   const params = await searchParams;
   const kind = ASSET_KINDS.includes(params.kind as AssetKind) ? (params.kind as AssetKind) : undefined;
-  const assets = repo.listAssets({
+  const assets = await repo.listAssets({
     kind,
     search: params.search,
     companyId: params.companyId ? Number(params.companyId) : undefined,
   });
-  const companies = repo.listCompanies();
+  const companies = await repo.listCompanies();
   const byKind = assets.reduce<Record<string, number>>((acc, asset) => {
     acc[asset.kind] = (acc[asset.kind] ?? 0) + 1;
     return acc;

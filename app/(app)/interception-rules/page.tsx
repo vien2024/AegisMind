@@ -6,5 +6,5 @@ export const dynamic = "force-dynamic";
 
 export default async function InterceptionRulesPage() {
   await requirePageUser();
-  return <InterceptionClient autoApprove={repo.getSystemSettings().autoApprove} />;
+  return <InterceptionClient autoApprove={(await repo.getSystemSettings()).autoApprove} />;
 }

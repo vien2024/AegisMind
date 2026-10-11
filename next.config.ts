@@ -8,8 +8,6 @@ const allowedDevOrigins = (process.env.NEXT_ALLOWED_DEV_ORIGINS ?? "")
 const nextConfig: NextConfig = {
   // Self-contained server bundle for `docker run` (see Dockerfile).
   output: "standalone",
-  // better-sqlite3 is a native module: keep it external to the server bundle.
-  serverExternalPackages: ["better-sqlite3"],
   // Cloud previews are served from a per-VM hostname that changes on restore, so it is supplied
   // per process instead of being committed here.
   ...(allowedDevOrigins.length ? { allowedDevOrigins } : {}),

@@ -6,12 +6,17 @@ import type { Language } from "@/lib/types";
 export async function GET() {
   const denied = await unauthorized();
   if (denied) return denied;
-  const tasks = repo.listTasks().map((task) => ({
-    ...task,
-    counts: repo.nodeKindCounts(task.id),
-    findings: repo.listFindings(task.id).length,
-  }));
-  return Response.json({ tasks });
+  const tasks = await repo.listTasks();
+  const tasksWithCounts = await Promise.all(
+    tasks.map(
+      async (task) => ({
+        ...task,
+        counts: await repo.nodeKindCounts(task.id),
+        findings: (await repo.listFindings(task.id)).length,
+      }),
+    ),
+  );
+  return Response.json({ tasks: tasksWithCounts });
 }
 
 export async function POST(request: Request) {
@@ -27,7 +32,7 @@ export async function POST(request: Request) {
     autoApprove?: boolean;
   };
   if (!body.target?.trim()) return Response.json({ error: "target is required" }, { status: 400 });
-  const task = createTaskFromInput({
+  const task = await createTaskFromInput({
     name: body.name?.trim() || `Task against ${body.target.trim()}`,
     target: body.target.trim(),
     description: body.description,

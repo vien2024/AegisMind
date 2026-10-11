@@ -36,11 +36,11 @@ export interface OverviewPayload {
   generatedAt: string;
 }
 
-export function buildOverview(): OverviewPayload {
-  const tasks: Task[] = repo.listTasks();
-  const allFindings = repo.listFindings();
-  const assets = repo.listAssets();
-  const usage = repo.usageTotals();
+export async function buildOverview(): Promise<OverviewPayload> {
+  const tasks = await repo.listTasks();
+  const allFindings = await repo.listFindings();
+  const assets = await repo.listAssets();
+  const usage = await repo.usageTotals();
 
   const counts = (status: string) => tasks.filter((task) => task.status === status).length;
   const bySeverity = allFindings.reduce<Record<string, number>>((acc, finding) => {
@@ -54,13 +54,20 @@ export function buildOverview(): OverviewPayload {
 
   const taskName = (id: number | null) => tasks.find((task) => task.id === id)?.name ?? null;
 
-  const activity = tasks
-    .flatMap((task) => repo.listActivity(task.id, 40))
+  const activity = (
+    await Promise.all(
+      tasks.map((task) => repo.listActivity(task.id, 40)),
+    )
+  )
+    .flat()
     .sort((a, b) => b.id - a.id)
     .slice(0, 30)
     .map((entry) => ({ ...entry, task_name: taskName(entry.task_id) }));
 
-  const recent = allFindings.slice(0, 8).map((finding) => ({ ...finding, task_name: taskName(finding.task_id) }));
+  const recent = allFindings.slice(0, 8).map((finding) => ({
+    ...finding,
+    task_name: taskName(finding.task_id),
+  }));
 
   return {
     tasks: {
@@ -81,11 +88,11 @@ export function buildOverview(): OverviewPayload {
       bySeverity,
       recent,
     },
-    traffic: { total: repo.listTraffic(undefined, 5000).length },
+    traffic: { total: (await repo.listTraffic(undefined, 5000)).length },
     usage: {
       ...usage,
       cacheHitRate: usage.total > 0 ? Math.round((usage.cacheRead / usage.total) * 100) : 0,
-      live: repo.listUsage(1).some((row) => row.live === 1),
+      live: (await repo.listUsage(1)).some((row) => row.live === 1),
     },
     activity,
     generatedAt: new Date().toISOString(),

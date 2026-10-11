@@ -12,10 +12,10 @@ export default async function ApprovalRecordsPage({
 }) {
   await requirePageUser();
   const params = await searchParams;
-  const tasks = repo.listTasks();
+  const tasks = await repo.listTasks();
   const taskName = (id: number | null) => tasks.find((task) => task.id === id)?.name ?? null;
 
-  const all = repo.listApprovals();
+  const all = await repo.listApprovals();
   const rows = all.filter((approval) => (params.status ? approval.status === params.status : true));
   const statuses = [...new Set(all.map((approval) => approval.status))];
 

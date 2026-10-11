@@ -5,17 +5,15 @@
 #   docker build -t aegismind .
 #   docker run -d --name aegismind -p 3000:3000 -v aegismind-data:/app/data aegismind
 #
-# The data volume holds the SQLite database; everything else is read-only state.
+# The data volume holds application state (seeds, uploads, etc.). The primary
+# data store is now Postgres (see docker-compose.yml).
 # ---------------------------------------------------------------------------
 
 FROM node:22-bookworm-slim AS base
 ENV NEXT_TELEMETRY_DISABLED=1
 
-# --- dependencies: compile better-sqlite3 when no prebuilt binary matches ---
+# --- dependencies ----------------------------------------------------------
 FROM base AS deps
-RUN apt-get update \
-  && apt-get install -y --no-install-recommends python3 make g++ ca-certificates \
-  && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --no-audit --no-fund
@@ -32,8 +30,7 @@ FROM base AS runner
 WORKDIR /app
 ENV NODE_ENV=production \
     PORT=3000 \
-    HOSTNAME=0.0.0.0 \
-    AEGISMIND_DB=/app/data/aegismind.db
+    HOSTNAME=0.0.0.0
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates \
@@ -46,8 +43,6 @@ RUN apt-get update \
 COPY --from=build --chown=nextjs:nodejs /app/.next/standalone ./
 COPY --from=build --chown=nextjs:nodejs /app/.next/static ./.next/static
 COPY --from=build --chown=nextjs:nodejs /app/public ./public
-# better-sqlite3 stays external to the server bundle, so ship its compiled binding
-COPY --from=build --chown=nextjs:nodejs /app/node_modules/better-sqlite3 ./node_modules/better-sqlite3
 
 USER nextjs
 EXPOSE 3000

@@ -8,7 +8,7 @@ export const dynamic = "force-dynamic";
 export async function GET() {
   const denied = await unauthorized();
   if (denied) return denied;
-  const configs = repo.listLlmConfigs().map((c) => ({
+  const configs = (await repo.listLlmConfigs()).map((c) => ({
     id: c.id,
     name: c.name,
     provider: c.provider,
@@ -53,7 +53,7 @@ export async function POST(request: Request) {
       );
     }
   }
-  const config = repo.createLlmConfig({
+  const config = await repo.createLlmConfig({
     name: body.name?.trim() || `${body.provider} ${body.model}`,
     provider: body.provider as ProviderId,
     model: body.model.trim(),

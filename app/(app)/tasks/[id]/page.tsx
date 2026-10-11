@@ -7,20 +7,20 @@ export const dynamic = "force-dynamic";
 
 export default async function TaskPage({ params }: { params: Promise<{ id: string }> }) {
   const id = Number((await params).id);
-  const task = repo.getTask(id);
+  const task = await repo.getTask(id);
   if (!task) notFound();
-  const graph = taskGraph(id);
+  const graph = await taskGraph(id);
 
   return (
     <TaskDetail
       initial={{
         task,
-        counts: repo.nodeKindCounts(id),
+        counts: await repo.nodeKindCounts(id),
         nodes: graph.nodes,
         edges: graph.edges,
         anchors: graph.anchors,
         assets: graph.assets,
-        coverage: coverageReport(id),
+        coverage: await coverageReport(id),
       }}
     />
   );

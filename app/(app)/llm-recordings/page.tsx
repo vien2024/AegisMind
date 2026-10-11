@@ -13,9 +13,9 @@ function compact(value: number): string {
 
 export default async function LlmRecordingsPage() {
   await requirePageUser();
-  const tasks = repo.listTasks();
-  const rows = repo.listUsage(300);
-  const totals = repo.usageTotals();
+  const tasks = await repo.listTasks();
+  const rows = await repo.listUsage(300);
+  const totals = await repo.usageTotals();
 
   return (
     <>

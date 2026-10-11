@@ -6,10 +6,11 @@ export const dynamic = "force-dynamic";
 
 export default async function TasksPage() {
   await requirePageUser();
-  const tasks = repo.listTasks().map((task) => ({
+  const tasks = (await repo.listTasks()).map(async (task) => ({
     ...task,
-    counts: repo.nodeKindCounts(task.id),
-    findings: repo.listFindings(task.id).length,
+    counts: await repo.nodeKindCounts(task.id),
+    findings: (await repo.listFindings(task.id)).length,
   }));
-  return <TasksClient initialTasks={tasks} companies={repo.listCompanies()} />;
+  const tasksWithCounts = await Promise.all(tasks);
+  return <TasksClient initialTasks={tasksWithCounts} companies={await repo.listCompanies()} />;
 }
