@@ -11,3 +11,6 @@ data/*.db-shm
 logs/
 *.tsbuildinfo
 next-env.d.ts
+
+# Export bundle for sharing (not part of the source tree)
+*.bundle
