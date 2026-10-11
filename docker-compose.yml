@@ -1,0 +1,30 @@
+services:
+  aegismind:
+    build: .
+    image: aegismind:latest
+    container_name: aegismind
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    # Copy .env.example to .env and edit it; compose fails fast if it is missing.
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      NODE_ENV: production
+      AEGISMIND_DB: /app/data/aegismind.db
+    volumes:
+      - aegismind-data:/app/data
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch("http://127.0.0.1:3000/api/health").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+
+volumes:
+  aegismind-data:

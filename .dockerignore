@@ -1,0 +1,21 @@
+# build artifacts
+node_modules
+.next
+out
+data
+logs
+.data
+
+# secrets and local env — pass them through compose/env_file instead
+.env
+.env.*
+!.env.example
+
+# repo metadata
+.git
+.gitignore
+*.tsbuildinfo
+npm-debug.log*
+Dockerfile
+docker-compose.yml
+README.md

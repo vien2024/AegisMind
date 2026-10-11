@@ -1,0 +1,16 @@
+node_modules
+.next
+out
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+.env
+.env.local
+*.log
+logs/
+*.tsbuildinfo
+next-env.d.ts
+
+# Export bundle for sharing (not part of the source tree)
+*.bundle
