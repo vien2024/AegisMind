@@ -1,4 +1,4 @@
-# AegisMind — Next.js edition
+# AegisMind — AI IDE for web pentest
 
 A local, single-process rebuild of [AegisMind](https://github.com/cskwork/aegismind) (itself a
 derivative of [Autumn-27/ARTEX](https://github.com/Autumn-27/ARTEX)) in which **both the frontend and
