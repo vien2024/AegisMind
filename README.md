@@ -26,6 +26,21 @@ re-expresses them with:
 
 ---
 
+## Screenshots
+
+<table>
+  <tr>
+    <td align="center" width="33%"><img src="docs/images/dashboard.png" alt="AegisMind dashboard" width="100%"></td>
+    <td align="center" width="33%"><img src="docs/images/task-overview.png" alt="AegisMind task overview" width="100%"></td>
+    <td align="center" width="33%"><img src="docs/images/exploration-graph.png" alt="AegisMind exploration graph" width="100%"></td>
+  </tr>
+  <tr>
+    <td align="center"><strong>Dashboard</strong></td>
+    <td align="center"><strong>Task overview</strong></td>
+    <td align="center"><strong>Exploration graph</strong></td>
+  </tr>
+</table>
+
 ## Quick start
 
 ```bash
@@ -162,6 +177,35 @@ Event-driven and bounded per round:
 
 If the interception gate is on and a tool call is held, the task is set to **paused**, the intent to
 `awaiting_approval`, and the operator's decision resumes the task automatically.
+
+### Agent architecture
+
+The planner assigns work to specialist workers and reviews their results. Task chat is a separate
+agent for operator questions.
+
+<!-- mermaid-checked: no \n, no em-dash/en-dash, no {} in labels, subgraphs are id["label"], arrows use quoted labels, all subgraphs closed by end, ids unique -->
+```mermaid
+flowchart TD
+    Operator["Operator"]
+    Engine["Task engine"]
+    Planner["Planner"]
+    Workers["Specialist workers"]
+    AssetGraph[("Shared asset graph")]
+    ExplorationGraph[("Per-task exploration graph")]
+    Anchors["Anchors link evidence to assets"]
+    Chat["Task chat"]
+
+    Operator -->|"starts and controls"| Engine
+    Engine -->|"runs"| Planner
+    Planner -->|"delegates tasks"| Workers
+    Workers -->|"record observed assets"| AssetGraph
+    Workers -->|"record intents facts and findings"| ExplorationGraph
+    ExplorationGraph -->|"linked to relevant assets by"| Anchors
+    Anchors -->|"reference"| AssetGraph
+    ExplorationGraph -->|"reviewed by"| Planner
+    AssetGraph -->|"scope and coverage"| Planner
+    Operator -->|"asks questions"| Chat
+```
 
 ### Agent workflows with the Vercel AI SDK
 
