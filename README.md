@@ -30,9 +30,9 @@ re-expresses them with:
 
 <table>
   <tr>
-    <td align="center" width="33%"><img src="docs/images/dashboard.png" alt="AegisMind dashboard" width="100%"></td>
-    <td align="center" width="33%"><img src="docs/images/task-overview.png" alt="AegisMind task overview" width="100%"></td>
-    <td align="center" width="33%"><img src="docs/images/exploration-graph.png" alt="AegisMind exploration graph" width="100%"></td>
+    <td align="center" width="33%"><img src="img/dashboard.png" alt="AegisMind dashboard" width="100%"></td>
+    <td align="center" width="33%"><img src="img/task-overview.png" alt="AegisMind task overview" width="100%"></td>
+    <td align="center" width="33%"><img src="img/exploration-graph.png" alt="AegisMind exploration graph" width="100%"></td>
   </tr>
   <tr>
     <td align="center"><strong>Dashboard</strong></td>
