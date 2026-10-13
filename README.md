@@ -1,4 +1,4 @@
-# AegisMind — AI IDE for web pentest
+# AegisMind — AI pentest tool for web security
 
 A local, single-process rebuild of [AegisMind](https://github.com/cskwork/aegismind) (itself a
 derivative of [Autumn-27/ARTEX](https://github.com/Autumn-27/ARTEX)) in which **both the frontend and
