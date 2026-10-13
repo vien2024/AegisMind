@@ -19,7 +19,7 @@ export default async function TrafficPage({
     <>
       <SectionHeading
         title="Traffic"
-        subtitle="Recorded exchanges from the agent tools — simulated locally in this edition"
+        subtitle="Recorded live validator exchanges and any legacy task traffic"
       />
 
       <Card

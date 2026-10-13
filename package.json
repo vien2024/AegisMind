@@ -10,6 +10,9 @@
     "typecheck": "tsc --noEmit",
     "smoke:agent": "tsx scripts/smoke-agent.ts",
     "smoke:engine": "tsx scripts/smoke-engine.ts",
+    "smoke:commands": "tsx scripts/smoke-command-runner.ts",
+    "smoke:mcp": "tsx scripts/smoke-mcp.ts",
+    "smoke:validator": "tsx scripts/smoke-validator.ts",
     "reset-password": "tsx scripts/reset-password.ts"
   },
   "dependencies": {
@@ -17,6 +20,7 @@
     "@ai-sdk/openai": "^4.0.91",
     "@ai-sdk/provider": "^4.0.26",
     "@ai-sdk/react": "^4.0.140",
+    "@modelcontextprotocol/sdk": "^1.32.1",
     "ai": "^7.0.137",
     "next": "^16.4.0",
     "pg": "^8.13.1",

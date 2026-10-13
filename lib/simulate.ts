@@ -1,4 +1,4 @@
-import type { Asset, AssetKind, Severity } from "./types";
+import type { Asset, AssetKind } from "./types";
 
 /**
  * Deterministic, offline reconnaissance simulator.
@@ -32,18 +32,9 @@ function mulberry32(seed: number) {
 
 const SUBDOMAIN_WORDS = ["api", "dev", "staging", "admin", "vpn", "mail", "cdn", "portal", "beta", "internal"];
 const PATH_WORDS = ["login", "admin", "api/v1/users", "upload", "debug", "backup", ".git/config", "health"];
-const TECHNIQUES = ["dns", "http", "port_scan", "content_discovery", "tls", "fuzz"] as const;
+const TECHNIQUES = ["dns", "http", "port_scan", "content_discovery", "tls", "fuzz", "xss", "sqli", "xxe"] as const;
 export type Technique = (typeof TECHNIQUES)[number];
 export const RECON_TECHNIQUES = TECHNIQUES;
-
-const FINDING_TEMPLATES: Array<{ title: string; severity: Severity; description: string }> = [
-  { title: "Exposed version-control metadata", severity: "medium", description: "A repository metadata path is readable, which can disclose source code and history." },
-  { title: "Default administrative credentials", severity: "high", description: "The administrative console accepts a well-known default credential pair." },
-  { title: "Verbose error disclosure", severity: "low", description: "Stack traces are returned to the client, leaking framework and path information." },
-  { title: "Outdated TLS configuration", severity: "medium", description: "The endpoint negotiates deprecated protocol versions and weak cipher suites." },
-  { title: "Directory listing enabled", severity: "low", description: "Directory listings are enabled and enumerate files not meant to be public." },
-  { title: "Potential injection point", severity: "high", description: "A parameter reflects unsanitised input in a way that may permit injection." },
-];
 
 export interface SimulatedAsset {
   kind: AssetKind;
@@ -59,19 +50,11 @@ export interface SimulatedTraffic {
   response: string;
 }
 
-export interface SimulatedFinding {
-  title: string;
-  severity: Severity;
-  description: string;
-  evidence: string;
-}
-
 export interface SimulationResult {
   technique: Technique;
   summary: string;
   observations: string[];
   assets: SimulatedAsset[];
-  finding?: SimulatedFinding;
   traffic: SimulatedTraffic;
 }
 
@@ -121,6 +104,10 @@ export function simulateRecon(input: {
   ];
   const assets: SimulatedAsset[] = [];
 
+  if (["xss", "sqli", "xxe"].includes(technique)) {
+    observations.push(`${technique.toUpperCase()} specialist check is a simulation only; no payload was sent and no vulnerability was verified.`);
+  }
+
   if ((technique === "dns" || technique === "content_discovery") && host.includes(".") && /^[a-z0-9.-]+$/i.test(host)) {
     const count = 1 + Math.floor(rand() * 3);
     for (let i = 0; i < count; i += 1) {
@@ -142,7 +129,27 @@ export function simulateRecon(input: {
     if (!open.length) observations.push("no additional open ports observed (simulated)");
   }
 
-  if (technique === "http" || technique === "content_discovery" || technique === "fuzz") {
+  if (asset.kind === "endpoint" && ["http", "content_discovery", "fuzz"].includes(technique)) {
+    const endpointPath = asset.value.toLowerCase().replace(/^[a-z]+:\/\/[^/]+/, "");
+    observations.push(`endpoint mapped: ${asset.value} (simulated).`);
+    observations.push("candidate parameters to review: id, q, redirect, file (synthetic examples, not observed from a live request).");
+    observations.push(
+      /login|signin|auth|session/.test(endpointPath)
+        ? "authentication flow: login/session route candidate; flow was not observed in this offline simulation."
+        : "authentication flow: not observable in this offline simulation.",
+    );
+    if (asset.attributes?.mapping_depth !== 1 && endpointPath.split("/").filter(Boolean).length <= 1) {
+      const base = asset.value.replace(/\/$/, "");
+      for (const path of ["admin", "api", "login"]) {
+        assets.push({
+          kind: "endpoint",
+          value: `${base}/${path}`,
+          attributes: { source: "simulated", technique, mapping_depth: 1 },
+        });
+        observations.push(`hidden-path candidate ${path} (synthetic; not discovered from a live response).`);
+      }
+    }
+  } else if (technique === "http" || technique === "content_discovery" || technique === "fuzz") {
     const count = 1 + Math.floor(rand() * 3);
     for (let i = 0; i < count; i += 1) {
       const path = PATH_WORDS[Math.floor(rand() * PATH_WORDS.length)]!;
@@ -165,9 +172,8 @@ export function simulateRecon(input: {
     });
   }
 
-  const finding = rand() > 0.45 ? { ...FINDING_TEMPLATES[Math.floor(rand() * FINDING_TEMPLATES.length)]! } : undefined;
-  const status = finding ? 200 : [200, 204, 301, 403][Math.floor(rand() * 4)]!;
-  const url = host.startsWith("http") ? host : `https://${host}`;
+  const status = [200, 204, 301, 403][Math.floor(rand() * 4)]!;
+  const url = asset.kind === "endpoint" ? asset.value : host.startsWith("http") ? host : `https://${host}`;
 
   const result: SimulationResult = {
     technique,
@@ -175,24 +181,13 @@ export function simulateRecon(input: {
     observations,
     assets,
     traffic: {
-      method: technique === "http" || technique === "content_discovery" ? "GET" : "CONNECT",
-      url: technique === "dns" ? `dns://${host}` : `${url}/`,
+      method: ["http", "content_discovery", "fuzz", "xss", "sqli", "xxe"].includes(technique) ? "GET" : "CONNECT",
+      url: technique === "dns" ? `dns://${host}` : url,
       status,
       request: [`# simulated ${technique} request`, `target: ${host}`, `task: ${taskId}`, `intent: ${intentId}`].join("\n"),
-      response:
-        [`# simulated ${technique} response`, ...observations.map((o) => `- ${o}`)].join("\n") +
-        (finding ? `\n- signal: ${finding.title}` : ""),
+      response: [`# simulated ${technique} response`, ...observations.map((o) => `- ${o}`)].join("\n"),
     },
   };
-
-  if (finding) {
-    result.finding = {
-      title: finding.title,
-      severity: finding.severity,
-      description: finding.description,
-      evidence: `${observations.join("; ")} — reported by simulated ${technique} against ${host}.`,
-    };
-  }
 
   return result;
 }

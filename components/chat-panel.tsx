@@ -18,7 +18,8 @@ export function ChatPanel({ taskId }: { taskId: number }) {
         {messages.length === 0 && (
           <p className="text-[12px] text-faint">
             Ask the main agent about this task. It can read both graphs and send new intents on your behalf.
-            With no provider configured it answers from the local simulator.
+            A live model is required. It can run shell commands and Python scripts from the workspace without
+            per-run approval; these executions are time-limited but not sandboxed.
           </p>
         )}
         {messages.map((message: UIMessage) => (

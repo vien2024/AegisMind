@@ -1,6 +1,6 @@
 import { unauthorized, badRequest } from "@/lib/api";
 import * as repo from "@/lib/repo";
-import { providerEnvKey } from "@/lib/llm";
+import { defaultBaseUrl, providerEnvKey, providerRequiresApiKey } from "@/lib/llm";
 import { PROVIDERS, type ProviderId } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
@@ -25,6 +25,8 @@ export async function GET() {
       anthropic: Boolean(process.env.ANTHROPIC_API_KEY),
       openrouter: Boolean(process.env.OPENROUTER_API_KEY),
       orcarouter: Boolean(process.env.ORCAROUTER_API_KEY),
+      mistral: Boolean(process.env.MISTRAL_API_KEY),
+      ollama: Boolean(process.env.OLLAMA_API_KEY),
     },
   });
 }
@@ -45,11 +47,15 @@ export async function POST(request: Request) {
     return badRequest(`provider must be one of: ${PROVIDERS.join(", ")}`);
   }
   if (!body.model?.trim()) return badRequest("model is required");
-  if (body.provider !== "mock" && !body.apiKey?.trim()) {
-    const envKey = providerEnvKey(body.provider as ProviderId);
+  const provider = body.provider as ProviderId;
+  if (provider === "mock") {
+    return badRequest("The offline simulator is disabled for agent tasks. Configure a live model provider.");
+  }
+  const envKey = providerEnvKey(provider);
+  if (providerRequiresApiKey(provider, body.baseUrl || defaultBaseUrl(provider)) && !body.apiKey?.trim()) {
     if (!envKey || !process.env[envKey]) {
       return badRequest(
-        `an API key is required for ${body.provider} (paste one here, or set ${envKey ?? "the provider env key"})`,
+        `an API key is required for ${provider} (paste one here, or set ${envKey ?? "the provider env key"})`,
       );
     }
   }

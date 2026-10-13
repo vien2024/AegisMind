@@ -1,12 +1,22 @@
 import { ToolLoopAgent, stepCountIs, type ToolSet } from "ai";
-import { buildPlannerTools, buildWorkerTools, coverageSnapshot, graphOverview, type RunContext } from "./agent-tools";
+import {
+  buildPlannerTools,
+  buildWorkerTools,
+  buildDeadlineValidationTools,
+  buildMcpAgentTools,
+  plannerAssessmentSnapshot,
+  type RunContext,
+} from "./agent-tools";
 import { resolveModel } from "./llm";
-import type { MockStep } from "./mock-model";
 import * as repo from "./repo";
-import { simulateRecon, techniqueFor } from "./simulate";
 import type { Task } from "./types";
 
-function recordUsage(taskId: number, role: string, resolved: { provider: string; modelId: string; live: boolean }, usage: unknown) {
+function recordUsage(
+  taskId: number,
+  role: string,
+  resolved: { provider: string; modelId: string; live: boolean },
+  usage: unknown,
+) {
   const u = usage as
     | {
         inputTokens?: number;
@@ -28,71 +38,130 @@ function recordUsage(taskId: number, role: string, resolved: { provider: string;
   });
 }
 
-/* ------------------------------------------------------------------ */
-/* Instructions                                                        */
-/* ------------------------------------------------------------------ */
+const PLANNER_INSTRUCTIONS = `You are AegisMind's COORDINATOR. You do not perform security assessment, reconnaissance, command execution, Python execution, validation probes, or finding write-back yourself. Specialist subagents are the only agents that perform assessment work. Your job is to plan, delegate, review their results, and coordinate the next specialist batch.
 
-const PLANNER_INSTRUCTIONS = `You are the PLANNER of AegisMind, an LLM multi-agent exploration system.
-
-You are the only component allowed to generate intents. On every wake you:
-1. Read the exploration graph (get_graph_overview) and the coverage of in-scope assets (get_coverage).
-2. Maintain the shared planning todolist across wakes so a multi-step chain stays stable.
-3. Send 0..N intents. Most wakes send ZERO. Only send an intent when there is an uncovered,
-   specific direction that advances the goal. Never repeat an existing intent.
-4. Call prove_goal only when no reachable direction remains.
+On every wake:
+1. Own the persistent plan (todolist). If no plan exists, first call update_todolist with a concise phased plan: scope/discovery, independent authentication/authorization and input/SSRF review where relevant, then evidence/validation and summary. Create only steps relevant to this task. After saving a new plan, end this planner turn; dispatch on the next wake.
+2. On every later wake, carefully review the complete exploration graph, scoped asset graph, findings, and specialist results supplied in the coordinator review. Reconcile result summaries against graph facts, anchors, asset relationships, and finding validation states before planning the next batch.
+3. Delegate every assessment or evidence-gathering action to specialist subagents using dispatch_agents (or send_intent for one genuinely singular follow-up). Never attempt the assessment yourself. When valid in-scope work remains and no intent is already open for it, you MUST dispatch it in this turn rather than end with a status-only response.
+4. Name each intent with its specialist function, such as "Discovery:", "Authentication/Authorization:", "SSRF:", or "Business Logic:". Give each subagent one bounded objective, the evidence to gather, safe handling constraints, and relevant explicitly in-scope asset IDs. Do not duplicate completed or open work.
+5. Keep the todolist synchronized with delegated work. Mark steps done only when specialist results and graph evidence support completion; keep blocked/awaiting-approval work distinct from completed work.
+6. Call prove_goal only after reviewing all three evidence collections and confirming no actionable or open work remains and the goal is supported by recorded evidence. Do not infer reachability, services, paths, or vulnerabilities from a target name.
 
 Rules:
-- One intent = one worker = one bounded piece of work. Keep titles short and imperative.
-- Anchor each intent to the asset ids it probes.
-- If a step of your todolist depends on a fact that does not exist yet, mark it "blocked" and wait
-  for the next wake instead of sending it early.
-- This edition explores a strictly local, offline simulation. Do not attempt to reach real systems.`;
+- One intent = one bounded objective anchored only to relevant in-scope assets.
+- Never broaden the task's authorized scope. Every delegated intent must use relevant assets from the explicit task scope.
+- Specialists perform recon and assessment, write back evidence, and use the validator only through its required explicit approval gate. Do not label a finding confirmed without a supporting validator result; unsupported vulnerability classes remain unverified.
+- Never fabricate or modify evidence. Base decisions only on task input, graph contents, and recorded specialist results.`;
 
-const WORKER_INSTRUCTIONS = `You are a WORKER of AegisMind. You claim exactly ONE intent and you never expand it.
+const WORKER_INSTRUCTIONS = `You are an autonomous specialist SOLVER in AegisMind. You claim exactly ONE coordinator-assigned intent and never expand its scope.
 
 Workflow:
-1. get_intent_context to load the intent and its anchored assets. list_scope for the task scope.
+1. get_intent_context to load your specialization, objective, anchored endpoint, and task scope.
 2. Before doing new work, search_all_worker_traces for keywords from your intent so you can reuse
-   what other workers already observed (their in-process observations are valid evidence).
-3. Run tools with run_recon / http_probe / dns_lookup. These are LOCAL SIMULATIONS in this edition.
-4. Write back everything you learned:
+   prior live evidence (do not treat unsupported claims as evidence).
+3. Use execute_cmd and Python tools for reconnaissance as appropriate to the assigned specialist objective and explicitly authorized scope. These tools require no per-run approval, start from the workspace, time out after 60 seconds and cap output; they are not sandboxed. Do not claim commands or scripts succeeded without checking their returned exit code and output.
+4. If a legacy intent names "Map attack surface", perform its reconnaissance with shell/Python tools; the dedicated mapping tool has been removed.
+5. Do not invent services, endpoints, parameters, or security observations. Record the actual command/method and evidence for remote observations.
+6. For a potential XSS or SQL error issue, submit the evidence-backed finding, then call validate_finding with its finding_id and the observed/justified parameter. It sends only a fixed safe probe to the anchored in-scope endpoint, only when enabled and explicitly approved. Do not use command execution to evade validation approval or task scope. For unsupported classes such as SSRF, record only an unverified potential finding with evidence; do not imply that the validator tested it or create an unsafe probe.
+7. Write back only what is supported by evidence:
    - submit_asset for every new asset you observed (parent_id when known).
    - submit_fact for verified observations, anchored to the assets they concern.
-   - submit_finding when the observation proves a vulnerability, with severity and evidence.
-5. finish_intent with a one-line summary.
+   - For XSS and SQLi solver intents, call validate_finding on the anchored endpoint using an
+     observed query parameter or a clearly labelled parameter guess (for example, "q"). This
+     creates a potential candidate and requires manual approval before sending the validator's
+     single bounded probe.
+     Only a validator result of "confirmed" is confirmed; reflected-XSS remains potential because
+     script execution is not tested. XXE and other unsupported classes stay unverified; do not
+     craft invasive payloads.
+   - submit_finding for other potential issues only when live observations support them. Every
+     finding must include a description, safe reproduction steps, exact location, potential impact,
+     and concrete evidence. When an actual safe, in-scope test produced a payload and result, include
+     them as observed_payload and observed_result. These are reported evidence, not validator
+     confirmation. Never use simulated or inferred data as proof.
+8. finish_intent with a one-line summary that clearly states any unavailable evidence sources.
 
 Rules:
 - Do only your one intent. Do not invent new directions; that is the planner's job.
-- Prefer concrete evidence over speculation. If a tool is blocked pending approval, record what you
-  could complete and finish the intent.`;
+- Prefer concrete evidence over speculation. If a required tool is unavailable or fails, record what
+  you could complete and finish the intent.`;
 
-/* ------------------------------------------------------------------ */
-/* Prompt builders                                                     */
-/* ------------------------------------------------------------------ */
+async function plannerPrompt(
+  task: Task,
+  recoverFromIdle: boolean,
+): Promise<{ prompt: string; review: Awaited<ReturnType<typeof plannerAssessmentSnapshot>> }> {
+  const [scope, intents, review] = await Promise.all([
+    repo.listScopeAssets(task.id),
+    repo.listNodes(task.id, "intent", 100),
+    plannerAssessmentSnapshot(task.id),
+  ]);
+  const openIntents = intents.filter((intent) =>
+    ["pending", "running", "awaiting_approval"].includes(intent.status),
+  );
+  const recentIntents = intents
+    .filter((intent) => ["done", "blocked", "failed"].includes(intent.status))
+    .slice(0, 20);
+  const todolist = task.todolist ?? [];
 
-async function scopeSummary(taskId: number): Promise<string> {
-  const scope = await repo.listScopeAssets(taskId);
-  if (!scope.length) return "(no in-scope assets yet)";
-  return scope.map((a) => `- ${a.kind} ${a.value} (asset_id=${a.id})`).join("\n");
-}
-
-function plannerPrompt(task: Task): string {
-  return [
+  const prompt = [
     `Task: ${task.name}`,
     `Target: ${task.target}`,
     task.goal ? `Goal: ${task.goal}` : "Goal: determine the attack surface and record any findings.",
+    task.description ? `Supporting assessment context:\n${task.description}` : "",
     "",
-    "In-scope assets:",
-    "(in-scope assets loaded at wake time)",
+    "Explicit in-scope assets (use these IDs when creating intents):",
+    ...(scope.length
+      ? scope.slice(0, 100).map((asset) => `- id=${asset.id} kind=${asset.kind} value=${asset.value}`)
+      : ["- None are currently attached to this task. Do not invent or expand scope."]),
     "",
-    "Decide the next move. Remember: most wakes should send zero intents.",
+    "Currently open intents:",
+    ...(openIntents.length
+      ? openIntents.slice(0, 30).map((intent) => `- #${intent.id} [${intent.status}] ${intent.title}`)
+      : ["- None"]),
+    "",
+    "Recently completed or blocked intents (avoid repeating without a new evidence-based reason):",
+    ...(recentIntents.length
+      ? recentIntents.map((intent) => `- #${intent.id} [${intent.status}] ${intent.title}: ${(intent.content ?? "").slice(0, 240)}`)
+      : ["- None"]),
+    "",
+    "Shared todolist:",
+    ...(todolist.length
+      ? todolist.map((item) => `- [${item.status}] ${item.id}: ${item.text}${item.depends_on?.length ? ` (depends on ${item.depends_on.join(", ")})` : ""}`)
+      : ["- No steps recorded"]),
+    "",
+    "Fresh coordinator review of the current evidence. Read all three graphs/collections and reconcile specialist results before acting:",
+    JSON.stringify(review),
+    "",
+    recoverFromIdle
+      ? "Recovery: your previous coordinator turn produced no actionable delegation and did not prove the goal. Re-check the exploration graph, scoped asset graph, findings, and specialist results. If no todolist exists, call update_todolist to save the phased plan and end this turn. Otherwise you MUST update the plan and dispatch the next relevant, uncovered in-scope assessment work with dispatch_agents (or send_intent for one singular follow-up). Do not perform the assessment yourself or respond with only a status/pause recommendation. If scope is absent, do not fabricate assets; report the missing scope."
+      : "Coordinator cycle: if no todolist exists, call update_todolist to create the phased plan and end this turn; dispatch is gated until that plan is saved. Otherwise review the exploration graph, scoped asset graph, findings, and specialist results. If relevant in-scope work remains and no matching intent is open, update the plan and MUST delegate it with dispatch_agents (or send_intent for one singular follow-up). If matching intents are open, do not duplicate them; reconcile their outcomes and prepare any complementary delegation. You never execute assessment work yourself.",
+    "Do not claim an asset was tested or a security goal proved without supporting specialist results and graph evidence.",
   ].join("\n");
+  return { prompt, review };
+}
+
+function specialistAgentName(intentTitle?: string): string {
+  const title = intentTitle ?? "";
+  const prefix = title.match(/^\s*([^:]{1,48}):/)?.[1]?.trim();
+  const classification: Array<[string, RegExp]> = [
+    ["SSRF", /\bssrf\b/i],
+    ["Discovery", /\b(discovery|recon|enumerat|map attack surface)\b/i],
+    ["Authentication/Authorization", /\b(auth|authentication|authorization|access control)\b/i],
+    ["Business Logic", /\b(business logic|workflow abuse)\b/i],
+    ["XSS", /\b(xss|cross.site scripting)\b/i],
+    ["SQL Injection", /\b(sql.?i|sql injection)\b/i],
+  ];
+  const role = classification.find(([, pattern]) => pattern.test(prefix ?? title))?.[0] ?? prefix;
+  if (!role) return "Specialist assessment agent";
+  return `${role.replace(/\s+agent$/i, "")} agent`;
 }
 
 async function workerPrompt(task: Task, intentId: number): Promise<string> {
   const intent = await repo.getNode(intentId);
   return [
     `Task: ${task.name} (target ${task.target})`,
+    task.description ? `Supporting assessment context:\n${task.description}` : "",
+    `Role: ${specialistAgentName(intent?.title)}; treat the assigned intent as your only objective.`,
     `Your intent #${intentId}: ${intent?.title ?? "(unknown)"}`,
     intent?.content ? `Details: ${intent.content}` : "",
     "",
@@ -105,147 +174,20 @@ async function workerPrompt(task: Task, intentId: number): Promise<string> {
     .join("\n");
 }
 
-/* ------------------------------------------------------------------ */
-/* Offline (mock) scripts                                              */
-/* ------------------------------------------------------------------ */
-
-export async function plannerScript(taskId: number): Promise<MockStep[]> {
-  const overview = await graphOverview(taskId);
-  const coverage = await coverageSnapshot(taskId);
-  const steps: MockStep[] = [
-    { type: "tool", toolName: "get_graph_overview", input: {} },
-    { type: "tool", toolName: "get_coverage", input: {} },
-  ];
-
-  if (overview.goal?.status === "done") {
-    steps.push({ type: "text", text: "Goal already proven." });
-    return steps;
-  }
-  if (overview.openIntents.length > 0) {
-    steps.push({ type: "text", text: `Waiting for workers on ${overview.openIntents.length} open intent(s).` });
-    return steps;
-  }
-
-  const untested = coverage.filter((asset) => !asset.tested);
-  if (untested.length === 0) {
-    steps.push({
-      type: "tool",
-      toolName: "prove_goal",
-      input: {
-        conclusion:
-          "All in-scope assets were exercised and the exploration frontier is empty; no further direction remains.",
-      },
-    });
-    return steps;
-  }
-
-  const target = untested[0]!;
-  const asset: import("./types").Asset = (await repo.getAsset(target.id))!;
-  const technique = techniqueFor(asset, taskId);
-  steps.push({
-    type: "tool",
-    toolName: "send_intent",
-    input: {
-      title: `Assess ${target.value}`,
-      description: `Exercise ${target.value} with ${technique} to map reachable surface and collect evidence.`,
-      asset_ids: [target.id],
-    },
-  });
-  return steps;
-}
-
-export async function workerScript(taskId: number, intentId: number): Promise<MockStep[]> {
-  const anchored = await repo.listAnchoredAssetIds(intentId);
-  const assetId = anchored[0];
-  const steps: MockStep[] = [{ type: "tool", toolName: "get_intent_context", input: {} }];
-  if (assetId === undefined) {
-    steps.push({ type: "tool", toolName: "finish_intent", input: { summary: "Intent had no anchored asset; nothing to do." } });
-    return steps;
-  }
-  const asset = await repo.getAsset(assetId);
-  if (!asset) {
-    steps.push({ type: "tool", toolName: "finish_intent", input: { summary: "Anchored asset no longer exists." } });
-    return steps;
-  }
-
-  const technique = techniqueFor(asset, intentId);
-  steps.push({ type: "tool", toolName: "list_scope", input: {} });
-  steps.push({
-    type: "tool",
-    toolName: "search_all_worker_traces",
-    input: { query: asset.value.split(".")[0] ?? asset.value },
-  });
-  steps.push({ type: "tool", toolName: "run_recon", input: { asset_id: assetId, technique } });
-
-  // If the interception gate is on and no decision exists yet, the run_recon call above will be
-  // held. Stop here so the intent stays "awaiting_approval" and the engine pauses instead of
-  // finishing an intent that never actually ran.
-  const task = await repo.getTask(taskId);
-  const requiresApproval = task ? task.auto_approve !== 1 : false;
-  const decided = await repo.findDecidedApproval(taskId, intentId, "run_recon");
-  if (requiresApproval && !decided) {
-    steps.push({ type: "text", text: "Reconnaissance is held by the interception gate." });
-    return steps;
-  }
-
-  // simulateRecon is deterministic, so the script can predict what run_recon will return
-  // and emit the matching write-back calls.
-  const predicted = simulateRecon({ taskId, intentId, asset, technique });
-  steps.push({
-    type: "tool",
-    toolName: "submit_fact",
-    input: {
-      title: `${technique} surface of ${asset.value}`,
-      content: predicted.observations.join("\n"),
-      anchor_asset_ids: [assetId],
-    },
-  });
-  for (const discovered of predicted.assets) {
-    steps.push({
-      type: "tool",
-      toolName: "submit_asset",
-      input: {
-        kind: discovered.kind,
-        value: discovered.value,
-        parent_id: assetId,
-        attributes: discovered.attributes ?? {},
-      },
-    });
-  }
-  if (predicted.finding) {
-    steps.push({
-      type: "tool",
-      toolName: "submit_finding",
-      input: {
-        title: predicted.finding.title,
-        severity: predicted.finding.severity,
-        description: predicted.finding.description,
-        evidence: predicted.finding.evidence,
-        asset_id: assetId,
-      },
-    });
-  }
-  steps.push({ type: "tool", toolName: "finish_intent", input: { summary: predicted.summary } });
-  return steps;
-}
-
-/* ------------------------------------------------------------------ */
-/* Turns                                                               */
-/* ------------------------------------------------------------------ */
-
 export async function runPlannerTurn(
   taskId: number,
+  options: { recoverFromIdle?: boolean; abortSignal?: AbortSignal } = {},
 ): Promise<{ proved: boolean; live: boolean; provider: string }> {
   const task = await repo.getTask(taskId);
   if (!task) return { proved: false, live: false, provider: "none" };
 
   const ctx: RunContext = { task, role: "planner" };
-  const tools = buildPlannerTools(ctx) as unknown as ToolSet;
+  const tools = {
+    ...buildPlannerTools(ctx),
+    ...await buildMcpAgentTools(ctx, "planner"),
+  } as unknown as ToolSet;
   const settings = await repo.getSystemSettings();
-  const resolved = await resolveModel({
-    script: await plannerScript(taskId),
-    modelId: "aegismind-planner-sim",
-  });
+  const resolved = await resolveModel();
 
   const agent = new ToolLoopAgent({
     id: "planner",
@@ -257,7 +199,24 @@ export async function runPlannerTurn(
 
   await repo.addActivity({ taskId, role: "planner", type: "wake", title: "planner wake" });
   const goalBefore = (await repo.listNodes(taskId, "goal", 1))[0];
-  const result = await agent.generate({ prompt: plannerPrompt(task) });
+  const plannerContext = await plannerPrompt(task, options.recoverFromIdle ?? false);
+  await repo.addActivity({
+    taskId,
+    role: "planner",
+    type: "graph_read",
+    title: "planner reviewed exploration graph, asset graph, and findings",
+    content: `Reviewed ${plannerContext.review.explorationGraph.nodes.length} exploration nodes, ${plannerContext.review.assetGraph.nodes.length} in-scope assets, ${plannerContext.review.findings.length} findings, and ${plannerContext.review.workerResults.length} specialist activity records.`,
+    data: {
+      exploration_nodes: plannerContext.review.explorationGraph.nodes.length,
+      asset_nodes: plannerContext.review.assetGraph.nodes.length,
+      findings: plannerContext.review.findings.length,
+      worker_results: plannerContext.review.workerResults.length,
+    },
+  });
+  const result = await agent.generate({
+    prompt: plannerContext.prompt,
+    abortSignal: options.abortSignal,
+  });
   await recordUsage(taskId, "planner", resolved, result.usage);
   const goalAfter = (await repo.listNodes(taskId, "goal", 1))[0];
 
@@ -281,46 +240,49 @@ export async function runWorkerTurn(
   taskId: number,
   intentId: number,
   workerIndex: number,
+  abortSignal?: AbortSignal,
 ): Promise<void> {
   const task = await repo.getTask(taskId);
   if (!task) return;
 
+  const intent = await repo.getNode(intentId);
+  const agentName = specialistAgentName(intent?.title);
   await repo.updateNodeStatus(intentId, "running");
-  const ctx: RunContext = { task, role: "worker", intentId, workerIndex };
-  const tools = buildWorkerTools(ctx) as unknown as ToolSet;
+  const ctx: RunContext = { task, role: "worker", intentId, workerIndex, agentName };
+  const tools = {
+    ...buildWorkerTools(ctx),
+    ...await buildMcpAgentTools(ctx, "subagent"),
+  } as unknown as ToolSet;
   const settings = await repo.getSystemSettings();
-  const resolved = await resolveModel({
-    script: await workerScript(taskId, intentId),
-    modelId: `aegismind-worker-sim`,
-  });
-
-  const agent = new ToolLoopAgent({
-    id: `worker-${workerIndex}`,
-    model: resolved.model,
-    instructions: WORKER_INSTRUCTIONS,
-    tools,
-    stopWhen: stepCountIs(settings.workerMaxSteps),
-  });
 
   try {
-    const result = await agent.generate({ prompt: await workerPrompt(task, intentId) });
+    const resolved = await resolveModel();
+    const agent = new ToolLoopAgent({
+      id: `worker-${workerIndex}`,
+      model: resolved.model,
+      instructions: WORKER_INSTRUCTIONS,
+      tools,
+      stopWhen: stepCountIs(settings.workerMaxSteps),
+    });
+    const result = await agent.generate({ prompt: await workerPrompt(task, intentId), abortSignal });
     await recordUsage(taskId, `worker#${workerIndex}`, resolved, result.usage);
     await repo.addActivity({
       taskId,
       intentId,
-      role: `worker#${workerIndex}`,
+      role: agentName,
       type: "message",
-      title: `worker#${workerIndex} finished intent #${intentId}`,
+      title: `${agentName} finished intent #${intentId}`,
       content: result.text?.slice(0, 4000) ?? "",
       data: { steps: result.steps.length, provider: resolved.provider, live: resolved.live },
     });
   } catch (error) {
+    await repo.updateNodeStatus(intentId, "failed");
     await repo.addActivity({
       taskId,
       intentId,
-      role: `worker#${workerIndex}`,
+      role: agentName,
       type: "error",
-      title: `worker#${workerIndex} failed intent #${intentId}`,
+      title: `${agentName} failed intent #${intentId}`,
       content: error instanceof Error ? error.message : String(error),
     });
   } finally {
@@ -329,4 +291,71 @@ export async function runWorkerTurn(
       await repo.updateNodeStatus(intentId, "done");
     }
   }
+
+}
+
+export async function runDeadlineValidationTurn(
+  taskId: number,
+  intentId: number,
+  validationCandidates: Array<{
+    findingId: number;
+    type: "reflected_xss" | "sql_error";
+    parameter: string;
+  }>,
+): Promise<void> {
+  const task = await repo.getTask(taskId);
+  if (!task) throw new Error(`Task ${taskId} was not found during deadline validation`);
+  const intent = await repo.getNode(intentId);
+  if (!intent) throw new Error(`Deadline-validation intent ${intentId} was not found`);
+
+  const findings = await Promise.all(validationCandidates.map(({ findingId }) => repo.getFinding(findingId)));
+  const candidates = validationCandidates.flatMap((candidate, index) => {
+    const finding = findings[index];
+    return finding?.validator_status === "unverified"
+      ? [{
+          finding_id: finding.id,
+          title: finding.title,
+          type: candidate.type,
+          parameter: candidate.parameter,
+        }]
+      : [];
+  });
+
+  const ctx: RunContext = {
+    task,
+    role: "worker",
+    intentId,
+    workerIndex: 0,
+    agentName: "Deadline validation agent",
+  };
+  const tools = buildDeadlineValidationTools(ctx) as unknown as ToolSet;
+  const settings = await repo.getSystemSettings();
+  const resolved = await resolveModel();
+  const agent = new ToolLoopAgent({
+    id: "deadline-validation",
+    model: resolved.model,
+    instructions:
+      "You are AegisMind's deadline validation agent. The assessment window has ended. Do not perform reconnaissance, run commands, create findings, or expand scope. Use only the validate_finding tool for listed findings, with exactly the supplied type and parameter derived from the finding's recorded vulnerability class and exact location. Do not infer or change either value. Each probe requires explicit operator approval and is bounded by the validator. Findings without a supported class and exact parameter are not listed and remain unverified in the report.",
+    tools,
+    stopWhen: stepCountIs(settings.workerMaxSteps),
+  });
+  const result = await agent.generate({
+    prompt: [
+      `Task: ${task.name}`,
+      `Deadline-validation intent: ${intent.title}`,
+      "Validate each listed finding using the supplied type and parameter, which were derived from the recorded vulnerability class and exact location. Do not call any other tools.",
+      JSON.stringify(candidates),
+    ].join("\n"),
+  });
+  await recordUsage(taskId, "deadline_validation", resolved, result.usage);
+  await repo.addActivity({
+    taskId,
+    intentId,
+    role: "Deadline validation agent",
+    type: "message",
+    title: "deadline validation finished",
+    content: result.text?.slice(0, 4000) ?? "",
+    data: { finding_ids: candidates.map((candidate) => candidate.finding_id), steps: result.steps.length },
+  });
+  await repo.updateNodeStatus(intentId, "done");
 }

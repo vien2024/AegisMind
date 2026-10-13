@@ -1,7 +1,6 @@
 import { createOpenAI } from "@ai-sdk/openai";
 import { createAnthropic } from "@ai-sdk/anthropic";
 import type { LanguageModel } from "ai";
-import { createMockModel, type MockStep } from "./mock-model";
 import { getActiveLlmConfig } from "./repo";
 import type { ProviderId } from "./types";
 
@@ -16,6 +15,8 @@ export interface GatewaySpec {
   envKey: string;
   /** Model used when falling back to an environment key. Ids are vendor-prefixed. */
   defaultModel: string;
+  envBaseURL?: string;
+  envDefaultModel?: string;
 }
 
 export const GATEWAYS: Partial<Record<ProviderId, GatewaySpec>> = {
@@ -30,6 +31,20 @@ export const GATEWAYS: Partial<Record<ProviderId, GatewaySpec>> = {
     baseURL: "https://api.orcarouter.ai/v1",
     envKey: "ORCAROUTER_API_KEY",
     defaultModel: "openai/gpt-4o-mini",
+  },
+  mistral: {
+    label: "Mistral",
+    baseURL: "https://api.mistral.ai/v1",
+    envKey: "MISTRAL_API_KEY",
+    defaultModel: "mistral-small-latest",
+  },
+  ollama: {
+    label: "Ollama",
+    baseURL: "http://localhost:11434/v1",
+    envKey: "OLLAMA_API_KEY",
+    defaultModel: "llama3.2",
+    envBaseURL: "https://ollama.com/v1",
+    envDefaultModel: "gpt-oss:20b-cloud",
   },
 };
 
@@ -54,56 +69,77 @@ export function isOpenAICompatible(provider: ProviderId): boolean {
   return provider === "openai" || Boolean(GATEWAYS[provider]);
 }
 
-export interface ResolvedModel {
-  model: LanguageModel;
-  provider: ProviderId | "openai-env" | "anthropic-env" | "mock";
-  modelId: string;
-  live: boolean;
+function isLocalEndpoint(baseUrl: string | undefined): boolean {
+  if (!baseUrl) return false;
+  try {
+    return ["localhost", "127.0.0.1", "::1"].includes(new URL(baseUrl).hostname);
+  } catch {
+    return false;
+  }
 }
 
-export interface MockFallback {
-  script: MockStep[] | (() => MockStep | null);
-  modelId?: string;
+export function providerRequiresApiKey(provider: ProviderId, baseUrl: string | undefined): boolean {
+  if (provider === "mock") return false;
+  if ((provider === "mistral" || provider === "ollama") && isLocalEndpoint(baseUrl)) return false;
+  return Boolean(providerEnvKey(provider));
+}
+
+function apiKeyFor(provider: ProviderId, apiKey: string | null | undefined, baseUrl: string | undefined) {
+  const gateway = gatewayFor(provider);
+  return (
+    apiKey ||
+    (gateway ? process.env[gateway.envKey] : process.env.OPENAI_API_KEY) ||
+    (isLocalEndpoint(baseUrl) && (provider === "mistral" || provider === "ollama")
+      ? "local"
+      : undefined)
+  );
+}
+
+export interface ResolvedModel {
+  model: LanguageModel;
+  provider: ProviderId | "openai-env" | "anthropic-env";
+  modelId: string;
+  live: boolean;
 }
 
 /**
  * Resolve the language model for a run.
  *
- * Order: active DB configuration -> environment API key -> offline simulator.
- * The offline simulator is a real `LanguageModelV4` (see lib/mock-model.ts), so
- * the agent code path through the AI SDK is identical in every mode.
+ * Task agents must use a configured live provider. There is deliberately no
+ * simulator fallback: a missing or mock provider is a configuration error.
  */
-export async function resolveModel(mock: MockFallback): Promise<ResolvedModel> {
+export async function resolveModel(): Promise<ResolvedModel> {
   const config = await getActiveLlmConfig();
 
   if (config) {
     if (config.provider === "mock") {
-      return {
-        model: createMockModel(mock),
-        provider: "mock",
-        modelId: config.model,
-        live: false,
-      };
+      throw new Error("The active model profile is the offline simulator. Select a live model in Settings → LLM before running agents.");
     }
     if (isOpenAICompatible(config.provider)) {
       const gateway = gatewayFor(config.provider);
+      const baseURL = config.base_url || gateway?.baseURL;
+      const apiKey = apiKeyFor(config.provider, config.api_key, baseURL);
+      if (providerRequiresApiKey(config.provider, baseURL) && !apiKey) {
+        throw new Error(`The active ${config.provider} model profile has no API key. Configure a key or activate a local provider.`);
+      }
       const provider = createOpenAI({
-        apiKey:
-          config.api_key ||
-          (gateway ? process.env[gateway.envKey] : process.env.OPENAI_API_KEY),
-        baseURL:
-          config.base_url || gateway?.baseURL || undefined,
+        apiKey,
+        baseURL: baseURL || undefined,
       });
       return {
-        model: provider(config.model) as unknown as LanguageModel,
+        model: provider.chat(config.model) as unknown as LanguageModel,
         provider: config.provider,
         modelId: config.model,
         live: true,
       };
     }
     if (config.provider === "anthropic") {
+      const apiKey = config.api_key || process.env.ANTHROPIC_API_KEY;
+      if (!apiKey) {
+        throw new Error("The active Anthropic model profile has no API key. Configure a key in Settings → LLM.");
+      }
       const provider = createAnthropic({
-        apiKey: config.api_key || process.env.ANTHROPIC_API_KEY,
+        apiKey,
         baseURL: config.base_url || undefined,
       });
       return {
@@ -138,21 +174,18 @@ export async function resolveModel(mock: MockFallback): Promise<ResolvedModel> {
   for (const [providerId, gateway] of Object.entries(GATEWAYS)) {
     const apiKey = gateway && process.env[gateway.envKey];
     if (!apiKey || !gateway) continue;
-    const provider = createOpenAI({ apiKey, baseURL: gateway.baseURL });
+    const provider = createOpenAI({ apiKey, baseURL: gateway.envBaseURL ?? gateway.baseURL });
     return {
-      model: provider(gateway.defaultModel) as unknown as LanguageModel,
+      model: provider.chat(gateway.envDefaultModel ?? gateway.defaultModel) as unknown as LanguageModel,
       provider: providerId as ProviderId,
-      modelId: gateway.defaultModel,
+      modelId: gateway.envDefaultModel ?? gateway.defaultModel,
       live: true,
     };
   }
 
-  return {
-    model: createMockModel(mock),
-    provider: "mock",
-    modelId: mock.modelId ?? "aegismind-simulator",
-    live: false,
-  };
+  throw new Error(
+    "No live LLM provider is configured. Activate a provider in Settings → LLM, set a provider API key, or configure a local Mistral/Ollama endpoint.",
+  );
 }
 
 /** Build a model from explicit, not-yet-saved parameters (used by the connection test). */
@@ -164,14 +197,13 @@ export function buildModelFromParams(input: {
 }): ResolvedModel {
   if (isOpenAICompatible(input.provider)) {
     const gateway = gatewayFor(input.provider);
+    const baseURL = input.baseUrl || gateway?.baseURL;
     const provider = createOpenAI({
-      apiKey:
-        input.apiKey ||
-        (gateway ? process.env[gateway.envKey] : process.env.OPENAI_API_KEY),
-      baseURL: input.baseUrl || gateway?.baseURL || undefined,
+      apiKey: apiKeyFor(input.provider, input.apiKey, baseURL),
+      baseURL: baseURL || undefined,
     });
     return {
-      model: provider(input.model) as unknown as LanguageModel,
+      model: provider.chat(input.model) as unknown as LanguageModel,
       provider: input.provider,
       modelId: input.model,
       live: true,
@@ -189,10 +221,5 @@ export function buildModelFromParams(input: {
       live: true,
     };
   }
-  return {
-    model: createMockModel({ modelId: input.model, script: [{ type: "text", text: "ok" }] }),
-    provider: "mock",
-    modelId: input.model,
-    live: false,
-  };
+  throw new Error("The offline simulator cannot be used by task agents.");
 }

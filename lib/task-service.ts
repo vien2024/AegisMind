@@ -27,6 +27,7 @@ export async function createTaskFromInput(input: {
   goal?: string;
   language?: Language;
   concurrency?: number;
+  timeLimitMinutes?: number | null;
   autoApprove?: boolean;
 }): Promise<Task> {
   await seedDemoData();
@@ -52,30 +53,45 @@ export async function createTaskFromInput(input: {
 
 export async function taskGraph(taskId: number) {
   const nodes = await repo.listNodes(taskId, undefined, 1000);
-  const edges = await repo.listEdges(taskId);
-  const anchors = await Promise.all(
-    nodes.map(async (node) => ({
-      node_id: node.id,
-      asset_ids: await repo.listAnchoredAssetIds(node.id),
-    })),
-  );
-  const assetIds = new Set(anchors.flatMap((anchor) => anchor.asset_ids));
-  const assets = (await Promise.all(
-    [...assetIds].map((id) => repo.getAsset(id)),
-  ))
-    .filter((asset): asset is NonNullable<typeof asset> => asset != null)
-    .map((asset) => ({ id: asset.id, kind: asset.kind, value: asset.value }));
-  return { nodes, edges, anchors, assets };
+  const [edges, anchorRows, scope, testedIds] = await Promise.all([
+    repo.listEdges(taskId),
+    repo.listAnchorsForNodes(nodes.map((node) => node.id)),
+    repo.listScopeAssets(taskId),
+    repo.listTestedScopeAssetIds(taskId),
+  ]);
+  const assetIds = [...new Set(anchorRows.map((anchor) => anchor.asset_id))];
+  const assets = await repo.listAssetsByIds(assetIds);
+  const anchorsByNode = new Map<number, number[]>();
+  for (const anchor of anchorRows) {
+    const ids = anchorsByNode.get(anchor.node_id) ?? [];
+    ids.push(anchor.asset_id);
+    anchorsByNode.set(anchor.node_id, ids);
+  }
+  const anchors = nodes.map((node) => ({
+    node_id: node.id,
+    asset_ids: anchorsByNode.get(node.id) ?? [],
+  }));
+  return {
+    nodes,
+    edges,
+    anchors,
+    assets: assets.map((asset) => ({ id: asset.id, kind: asset.kind, value: asset.value })),
+    coverage: coverageFromScope(scope, testedIds),
+  };
+}
+
+function coverageFromScope(
+  scope: Awaited<ReturnType<typeof repo.listScopeAssets>>,
+  testedIds: number[],
+) {
+  const tested = new Set(testedIds);
+  return scope.map((asset) => ({ ...asset, tested: tested.has(asset.id) }));
 }
 
 export async function coverageReport(taskId: number) {
-  const scope = await repo.listScopeAssets(taskId);
-  const tested = new Set<number>();
-  for (const asset of scope) {
-    for (const nodeId of await repo.listNodeIdsForAsset(asset.id)) {
-      const node = await repo.getNode(nodeId);
-      if (node && ["intent", "fact", "finding"].includes(node.kind)) tested.add(asset.id);
-    }
-  }
-  return scope.map((asset) => ({ ...asset, tested: tested.has(asset.id) }));
+  const [scope, testedIds] = await Promise.all([
+    repo.listScopeAssets(taskId),
+    repo.listTestedScopeAssetIds(taskId),
+  ]);
+  return coverageFromScope(scope, testedIds);
 }

@@ -29,9 +29,17 @@ export async function POST(request: Request) {
     goal?: string;
     language?: Language;
     concurrency?: number;
+    timeLimitMinutes?: number | null;
     autoApprove?: boolean;
   };
   if (!body.target?.trim()) return Response.json({ error: "target is required" }, { status: 400 });
+  if (
+    body.timeLimitMinutes !== undefined &&
+    body.timeLimitMinutes !== null &&
+    (!Number.isInteger(body.timeLimitMinutes) || body.timeLimitMinutes < 1 || body.timeLimitMinutes > 1440)
+  ) {
+    return Response.json({ error: "timeLimitMinutes must be between 1 and 1440, or null for no limit" }, { status: 400 });
+  }
   const task = await createTaskFromInput({
     name: body.name?.trim() || `Task against ${body.target.trim()}`,
     target: body.target.trim(),
@@ -39,6 +47,7 @@ export async function POST(request: Request) {
     goal: body.goal,
     language: body.language,
     concurrency: body.concurrency,
+    timeLimitMinutes: body.timeLimitMinutes,
     autoApprove: body.autoApprove,
   });
   return Response.json({ task }, { status: 201 });

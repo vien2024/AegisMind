@@ -18,6 +18,7 @@ const STATUS_TONE: Record<string, string> = {
   running: "badge-running",
   paused: "badge-paused",
   pending: "badge-pending",
+  potential: "badge-pending",
   awaiting_approval: "badge-violet",
   blocked: "badge-failed",
   completed: "badge-completed",

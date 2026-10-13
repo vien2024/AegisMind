@@ -60,7 +60,7 @@ export function SetupForm() {
       <p className="flex items-start gap-1.5 text-[10.5px] leading-relaxed text-faint">
         <Icon name="alert" className="mt-0.5 h-3 w-3 shrink-0" />
         Demo fixtures (a fictional company and demo.example.com) are seeded on first run. This edition only
-        ever runs a local, offline simulator.
+        runs agents with a configured live model; simulated reconnaissance is disabled.
       </p>
     </form>
   );

@@ -7,11 +7,9 @@ import { Card, SectionHeading } from "@/components/ui";
 
 const GATED = [
   {
-    tool: "run_recon",
-    description: "Runs a reconnaissance technique against one in-scope asset through the local simulator.",
+    tool: "validate_finding",
+    description: "Sends one bounded live probe only after explicit approval; this remains gated when auto-approval is on.",
   },
-  { tool: "dns_lookup", description: "Resolves a hostname to addresses." },
-  { tool: "http_probe", description: "Sends an HTTP request to an in-scope endpoint." },
 ];
 
 const UNGATED = [
@@ -19,6 +17,12 @@ const UNGATED = [
   { tool: "submit_fact", description: "Writes a verified observation into the exploration graph." },
   { tool: "submit_finding", description: "Records a vulnerability as a finding." },
   { tool: "search_all_worker_traces", description: "Reads other workers' execution steps." },
+];
+
+const WORKSPACE_EXECUTION = [
+  { tool: "execute_cmd", description: "Runs shell commands from the workspace without per-run approval." },
+  { tool: "write_python_file", description: "Creates or replaces .py files in agent-python." },
+  { tool: "run_python_file", description: "Runs Python files from agent-python without per-run approval." },
 ];
 
 export function InterceptionClient({ autoApprove }: { autoApprove: boolean }) {
@@ -40,16 +44,17 @@ export function InterceptionClient({ autoApprove }: { autoApprove: boolean }) {
 
   return (
     <>
-      <SectionHeading title="Interception rules" subtitle="Which tool calls are gated before they may touch an asset" />
+      <SectionHeading title="Interception rules" subtitle="Default approval behavior for tools that touch assets" />
 
-      <Card title="Policy" icon="shield" subtitle="Applies to every task unless the task overrides it">
+      <Card title="Policy" icon="shield" subtitle="Applies to tools that require an approval decision">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="max-w-xl text-[12px] leading-relaxed text-muted">
             <p>
-              When auto-approval is <strong className="text-ink">on</strong>, each gated call is recorded and
-              allowed immediately. When it is <strong className="text-ink">off</strong>, the call is held: the
-              intent moves to <span className="mono">awaiting_approval</span>, the task pauses, and it resumes as
-              soon as a decision is recorded.
+              When auto-approval is <strong className="text-ink">on</strong>, ordinary gated calls are recorded
+              and allowed immediately. When it is <strong className="text-ink">off</strong>, those calls wait for
+            a decision. <span className="mono">validate_finding</span> always waits for a manual decision,
+            regardless of this setting. Workspace shell and Python tools run without per-invocation
+            approval and are not sandboxed.
             </p>
           </div>
           <button
@@ -69,11 +74,25 @@ export function InterceptionClient({ autoApprove }: { autoApprove: boolean }) {
         </div>
         <p className="mt-3 flex items-center gap-1.5 text-[11px] text-faint">
           <Icon name="shield" className="h-3.5 w-3.5" />
-          {enabled ? "Auto-approval on · calls are recorded and allowed" : "Auto-approval off · calls wait for a decision"}
+          {enabled ? "Auto-approval on · live validation remains approval-gated" : "Auto-approval off · gated calls wait for a decision"}
         </p>
       </Card>
 
       <div className="grid gap-4 lg:grid-cols-2">
+        <Card title="Workspace execution" icon="wrench" subtitle="Unrestricted and not sandboxed">
+          <ul className="space-y-2">
+            {WORKSPACE_EXECUTION.map((entry) => (
+              <li key={entry.tool} className="rounded-lg border border-border px-3 py-2">
+                <div className="mono text-[11.5px] text-ink">{entry.tool}</div>
+                <div className="text-[11px] text-muted">{entry.description}</div>
+              </li>
+            ))}
+            <li className="text-[11px] text-faint">
+              Each process has a 60-second timeout and capped returned output. Processes run with the
+              application user's operating-system permissions.
+            </li>
+          </ul>
+        </Card>
         <Card title="Gated tools" icon="lock" subtitle="Held or recorded before execution">
           <ul className="space-y-2">
             {GATED.map((entry) => (

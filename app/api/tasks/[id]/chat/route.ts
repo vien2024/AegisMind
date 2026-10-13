@@ -12,6 +12,13 @@ export async function POST(request: Request, { params }: Params) {
   if (!(await repo.getTask(id))) return badRequest("task not found", 404);
 
   const { messages } = (await request.json().catch(() => ({}))) as { messages?: unknown[] };
-  const agent = await buildMainAgent(id);
-  return createAgentUIStreamResponse({ agent, uiMessages: messages ?? [] });
+  try {
+    const agent = await buildMainAgent(id);
+    return createAgentUIStreamResponse({ agent, uiMessages: messages ?? [] });
+  } catch (error) {
+    return Response.json(
+      { error: error instanceof Error ? error.message : String(error) },
+      { status: 503 },
+    );
+  }
 }

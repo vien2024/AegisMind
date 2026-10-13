@@ -1,6 +1,12 @@
 import { ToolLoopAgent, stepCountIs, tool } from "ai";
 import { z } from "zod";
-import { coverageSnapshot, graphOverview } from "./agent-tools";
+import {
+  createCommandExecutionTool,
+  createPythonTools,
+  coverageSnapshot,
+  graphOverview,
+  type RunContext,
+} from "./agent-tools";
 import { resolveModel } from "./llm";
 import * as repo from "./repo";
 
@@ -10,14 +16,19 @@ Answer questions about this specific task using the read tools. You can also sen
 send_intent when the operator asks for a new direction, and re-open the goal with prove_goal once
 everything is covered.
 
-Be concise. Cite the intent/finding ids you used. This edition explores a local, offline simulation;
-never claim to have contacted a real system, and never instruct the operator to attack one.`;
+Be concise. Cite the intent/finding ids you used. Never invent observations or present simulated
+output as evidence. You can run shell commands and create/run Python files for workspace work without
+per-run approval. Those executions have time/output limits but are not sandboxed. Use them for
+reconnaissance only within the task's explicitly authorized scope, and do not bypass validator safety limits.`;
 
 export async function buildMainAgent(taskId: number) {
   const task = await repo.getTask(taskId);
   if (!task) throw new Error(`task ${taskId} not found`);
+  const ctx: RunContext = { task, role: "mainagent" };
 
   const tools = {
+    execute_cmd: createCommandExecutionTool(ctx),
+    ...createPythonTools(ctx),
     get_graph_overview: tool({
       description: "Read node counts, open intents, recent facts and findings for this task.",
       inputSchema: z.object({}),
@@ -38,6 +49,8 @@ export async function buildMainAgent(taskId: number) {
           severity: f.severity,
           status: f.status,
           description: f.description,
+          observed_payload: f.observed_payload,
+          observed_result: f.observed_result,
         })),
     }),
     list_recent_activity: tool({
@@ -73,16 +86,7 @@ export async function buildMainAgent(taskId: number) {
     }),
   };
 
-  const resolved = await resolveModel({
-    modelId: "aegismind-chat-sim",
-    script: () => ({
-      type: "text",
-      text:
-        "This task is running in offline simulator mode, so I can only answer from the local graphs. " +
-        "Open Settings → LLM configuration and add an OpenAI or Anthropic key to chat with a live model. " +
-        "Meanwhile, the Dashboard, exploration graph and findings views show everything the engine has produced.",
-    }),
-  });
+  const resolved = await resolveModel();
 
   return new ToolLoopAgent({
     id: "mainagent",

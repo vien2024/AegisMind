@@ -11,15 +11,19 @@ export async function GET(_request: Request, { params }: Params) {
   const id = Number((await params).id);
   const task = await repo.getTask(id);
   if (!task) return Response.json({ error: "not found" }, { status: 404 });
-  const graph = await taskGraph(id);
+  const [graph, counts, findings] = await Promise.all([
+    taskGraph(id),
+    repo.nodeKindCounts(id),
+    repo.listFindings(id),
+  ]);
   return Response.json({
     task,
-    counts: await repo.nodeKindCounts(id),
+    counts,
     nodes: graph.nodes,
     edges: graph.edges,
     anchors: graph.anchors,
-    findings: await repo.listFindings(id),
-    coverage: (await import("@/lib/task-service")).coverageReport(id),
+    findings,
+    coverage: graph.coverage,
   });
 }
 

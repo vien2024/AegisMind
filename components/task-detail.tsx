@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { AgentToolsPanel } from "@/components/agent-tools-panel";
 import { ChatPanel } from "@/components/chat-panel";
 import { Icon } from "@/components/shell/icons";
 import { Badge, Card, Empty, SeverityBadge, StatusBadge } from "@/components/ui";
@@ -25,9 +26,12 @@ interface GraphResponse {
   anchors: { node_id: number; asset_ids: number[] }[];
   assets: { id: number; kind: string; value: string }[];
   coverage: (Asset & { tested: boolean })[];
+  activity: ActivityRecord[];
+  findings: Finding[];
+  approvals: Approval[];
 }
 
-type Tab = "overview" | "graph" | "activity" | "findings" | "approvals" | "chat";
+type Tab = "overview" | "graph" | "activity" | "findings" | "approvals" | "tools" | "chat";
 
 const TABS: { id: Tab; label: string; icon: React.ComponentProps<typeof Icon>["name"] }[] = [
   { id: "overview", label: "Overview", icon: "dashboard" },
@@ -35,6 +39,7 @@ const TABS: { id: Tab; label: string; icon: React.ComponentProps<typeof Icon>["n
   { id: "activity", label: "Activity", icon: "activity" },
   { id: "findings", label: "Findings", icon: "bug" },
   { id: "approvals", label: "Interception approval", icon: "shield" },
+  { id: "tools", label: "Agent tools", icon: "wrench" },
   { id: "chat", label: "Main agent", icon: "chat" },
 ];
 
@@ -51,11 +56,12 @@ function ago(iso: string): string {
 export function TaskDetail({ initial }: { initial: GraphResponse }) {
   const router = useRouter();
   const [graph, setGraph] = useState<GraphResponse>(initial);
-  const [activity, setActivity] = useState<ActivityRecord[]>([]);
-  const [findings, setFindings] = useState<Finding[]>([]);
-  const [approvals, setApprovals] = useState<Approval[]>([]);
+  const [activity, setActivity] = useState<ActivityRecord[]>(initial.activity);
+  const [findings, setFindings] = useState<Finding[]>(initial.findings);
+  const [approvals, setApprovals] = useState<Approval[]>(initial.approvals);
   const [tab, setTab] = useState<Tab>("overview");
   const [busy, setBusy] = useState(false);
+  const [controlError, setControlError] = useState<string | null>(null);
   const taskId = initial.task.id;
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -94,11 +100,17 @@ export function TaskDetail({ initial }: { initial: GraphResponse }) {
 
   async function control(action: string) {
     setBusy(true);
-    await fetch(`/api/tasks/${taskId}/control`, {
+    const response = await fetch(`/api/tasks/${taskId}/control`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ action }),
     });
+    if (!response.ok) {
+      const payload = (await response.json().catch(() => ({}))) as { reason?: string; error?: string };
+      setControlError(payload.reason ?? payload.error ?? "Could not control task");
+    } else {
+      setControlError(null);
+    }
     setBusy(false);
     await refresh();
     router.refresh();
@@ -117,6 +129,7 @@ export function TaskDetail({ initial }: { initial: GraphResponse }) {
   const anchorsByNode = useMemo(() => new Map(graph.anchors.map((a) => [a.node_id, a.asset_ids])), [graph.anchors]);
   const testedCount = graph.coverage.filter((c) => c.tested).length;
   const goal = graph.nodes.find((n) => n.kind === "goal");
+  const timeLimitReached = activity.some((entry) => entry.title === "task time limit reached");
 
   return (
     <>
@@ -130,10 +143,25 @@ export function TaskDetail({ initial }: { initial: GraphResponse }) {
             <h1 className="truncate text-[20px] font-semibold tracking-tight text-ink">{graph.task.name}</h1>
             <StatusBadge status={graph.task.status} />
           </div>
+          {controlError && (
+            <p className="rounded-lg border border-red-300 px-3 py-2 text-[11px] text-red-700">
+              {controlError}
+            </p>
+          )}
           <p className="mono mt-1 text-[11px] text-muted">
             target: {graph.task.target} · concurrency: {graph.task.concurrency} · language: {graph.task.language}
+            {graph.task.time_limit_minutes ? ` · limit: ${graph.task.time_limit_minutes} min (wall-clock)` : " · no time limit"}
           </p>
-          {graph.task.error && <p className="mt-1 text-[11px] text-red-600">{graph.task.error}</p>}
+          {graph.task.error && (
+            <p className={`mt-1 text-[11px] ${graph.task.error.startsWith("Time limit reached") ? "text-amber-700" : "text-red-600"}`}>
+              {graph.task.error}
+            </p>
+          )}
+          {timeLimitReached && (
+            <p className="mt-1 text-[11px] text-amber-700">
+              Time limit reached. Normal assessment stopped; final validation and reporting are in progress or complete.
+            </p>
+          )}
         </div>
         <div className="flex flex-wrap gap-1.5">
           {graph.task.status === "running" ? (
@@ -347,6 +375,27 @@ export function TaskDetail({ initial }: { initial: GraphResponse }) {
                       <td className="max-w-[460px]">
                         <div className="text-[12.5px] font-medium text-ink">{finding.title}</div>
                         {finding.description && <div className="text-[11px] text-muted">{finding.description}</div>}
+                        <div className="mt-1 space-y-1 text-[10.5px] text-muted">
+                          <div>Validation: {finding.validator_status.replace(/_/g, " ")}</div>
+                          {finding.validator_payload && (
+                            <pre className="mono whitespace-pre-wrap break-all rounded border border-border bg-subtle p-1.5">
+                              Payload: {finding.validator_payload}
+                            </pre>
+                          )}
+                          {finding.validator_result && (
+                            <div className="whitespace-pre-wrap">{finding.validator_result}</div>
+                          )}
+                          {finding.observed_payload && (
+                            <pre className="mono whitespace-pre-wrap break-all rounded border border-border bg-subtle p-1.5">
+                              Observed payload: {finding.observed_payload}
+                            </pre>
+                          )}
+                          {finding.observed_result && (
+                            <div className="whitespace-pre-wrap">
+                              Observed result: {finding.observed_result}
+                            </div>
+                          )}
+                        </div>
                       </td>
                       <td className="mono text-[11px] text-muted">
                         {finding.asset_id ? assetsById.get(finding.asset_id)?.value ?? `#${finding.asset_id}` : "—"}
@@ -403,6 +452,8 @@ export function TaskDetail({ initial }: { initial: GraphResponse }) {
           <ChatPanel taskId={taskId} />
         </Card>
       )}
+
+      {tab === "tools" && <AgentToolsPanel />}
     </>
   );
 }

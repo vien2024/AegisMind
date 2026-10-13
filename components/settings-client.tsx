@@ -143,12 +143,13 @@ export function SettingsClient({ initial }: { initial: SettingsPayload }) {
           }
         >
           <p>
-            When enabled, tools that touch an asset (<span className="mono">run_recon</span>,{" "}
-            <span className="mono">dns_lookup</span>, <span className="mono">http_probe</span>) are approved
-            automatically and the run continues uninterrupted.
+            When enabled, ordinary gated calls may be approved automatically.{" "}
+            <span className="mono">validate_finding</span> always requires fresh manual approval.
+            Shell commands and Python scripts run without per-run approval, start in the workspace,
+            and are not sandboxed.
           </p>
           <p>
-            When disabled, every call is held for manual approval, the intent moves to{" "}
+            When disabled, every approval-gated call is held for manual approval, the intent moves to{" "}
             <span className="mono">awaiting_approval</span> and the task pauses until you decide. Decisions are
             recorded under{" "}
             <Link href="/approval-records" className="text-link hover:underline">
@@ -158,8 +159,8 @@ export function SettingsClient({ initial }: { initial: SettingsPayload }) {
           </p>
           <p className="text-[11px] text-faint">
             {settings.autoApprove
-              ? "Enabled · tools run without a prompt"
-              : "Disabled · each asset-touching call waits for approval"}
+              ? "Enabled · live validator probes still wait for approval"
+              : "Disabled · every gated call waits for approval"}
           </p>
         </SettingCard>
 
@@ -287,11 +288,17 @@ export function SettingsClient({ initial }: { initial: SettingsPayload }) {
           <p className="text-[11px] text-faint">
             Active model profile:{" "}
             {data.activeLlm ? (
-              <span className="mono text-ink">
-                {data.activeLlm.name} · {data.activeLlm.provider}/{data.activeLlm.model}
-              </span>
+              data.activeLlm.provider === "mock" ? (
+                <span className="text-red-600">
+                  {data.activeLlm.name} is a legacy simulator profile and cannot run agents. Activate a live model.
+                </span>
+              ) : (
+                <span className="mono text-ink">
+                  {data.activeLlm.name} · {data.activeLlm.provider}/{data.activeLlm.model}
+                </span>
+              )
             ) : (
-              "none — running against the offline simulator"
+              "none — task agents are disabled until a live provider is configured"
             )}
           </p>
         </SettingCard>

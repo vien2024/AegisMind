@@ -1,15 +1,33 @@
 import { tool } from "ai";
 import { z } from "zod";
 import { emitEvent } from "./events";
+import {
+  runWorkspaceCommand,
+  runWorkspacePythonFile,
+  writeWorkspacePythonFile,
+} from "./command-runner";
 import * as repo from "./repo";
-import { RECON_TECHNIQUES, simulateRecon, type Technique } from "./simulate";
+import { callMcpTool, listMcpServers, type McpAgentTarget } from "./mcp";
+import { extractHost } from "./simulate";
 import { ASSET_KINDS, NODE_KINDS, SEVERITIES, type Asset, type Task } from "./types";
+import {
+  assessValidationResponse,
+  craftValidationPayload,
+  sendValidationProbe,
+  VALIDATOR_TYPES,
+} from "./validator";
 
 export interface RunContext {
   task: Task;
-  role: "planner" | "worker";
+  role: "planner" | "worker" | "mainagent";
   intentId?: number;
   workerIndex?: number;
+  agentName?: string;
+}
+
+function activityRole(ctx: RunContext): string {
+  if (ctx.role !== "worker") return ctx.role;
+  return ctx.agentName ?? "Specialist assessment agent";
 }
 
 async function logActivity(
@@ -20,17 +38,22 @@ async function logActivity(
     taskId: ctx.task.id,
     intentId: ctx.intentId ?? null,
     step: input.step ?? null,
-    role: ctx.role === "planner" ? "planner" : `worker#${ctx.workerIndex ?? 1}`,
+    role: activityRole(ctx),
     type: input.type,
     title: input.title,
     content: input.content,
     data: input.data,
   });
-  emitEvent({ type: "activity", taskId: ctx.task.id, payload: { title: input.title, role: ctx.role } });
+  emitEvent({ type: "activity", taskId: ctx.task.id, payload: { title: input.title, role: activityRole(ctx) } });
 }
 
 /** Approval gate: every tool that would "touch" an asset passes through this. */
-async function guard(ctx: RunContext, toolName: string, args: Record<string, unknown>) {
+async function guard(
+  ctx: RunContext,
+  toolName: string,
+  args: Record<string, unknown>,
+  forceManual = false,
+) {
   // Honour a decision that was already made for this intent + tool so an
   // approved call is not re-queued on every wake.
   const decided = await repo.findDecidedApproval(ctx.task.id, ctx.intentId ?? null, toolName);
@@ -40,7 +63,7 @@ async function guard(ctx: RunContext, toolName: string, args: Record<string, unk
   }
 
   const autoApprove = ctx.task.auto_approve === 1;
-  if (autoApprove) {
+  if (autoApprove && !forceManual) {
     const approval = await repo.createApproval({
       taskId: ctx.task.id,
       intentId: ctx.intentId ?? null,
@@ -56,12 +79,198 @@ async function guard(ctx: RunContext, toolName: string, args: Record<string, unk
     intentId: ctx.intentId ?? null,
     tool: toolName,
     args,
-    reason: "task requires manual interception approval",
+    reason: forceManual
+      ? "Live vulnerability validation requires explicit approval before one bounded GET request."
+      : "task requires manual interception approval",
     status: "pending",
   });
   if (ctx.intentId) await repo.updateNodeStatus(ctx.intentId, "awaiting_approval");
   emitEvent({ type: "approval", taskId: ctx.task.id, payload: { approvalId: approval.id, tool: toolName } });
   return { approved: false as const, approvalId: approval.id };
+}
+
+async function waitForApproval(
+  taskId: number,
+  approvalId: number,
+  allowCompletedTask = false,
+): Promise<"approved" | "denied" | "cancelled" | "timed_out"> {
+  const deadline = Date.now() + 5 * 60 * 1000;
+  while (Date.now() < deadline) {
+    const approval = (await repo.listApprovals(taskId)).find((entry) => entry.id === approvalId);
+    if (approval?.status === "approved") return "approved";
+    if (approval?.status === "denied") return "denied";
+    const task = await repo.getTask(taskId);
+    if (!task || ["paused", "stopped", "failed"].includes(task.status) || (!allowCompletedTask && task.status === "completed")) {
+      return "cancelled";
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  return "timed_out";
+}
+
+export function createCommandExecutionTool(ctx: RunContext) {
+  return tool({
+      description:
+        "Run a shell command from the AegisMind workspace without a per-run approval. This is unrestricted command execution, not a sandbox. Commands time out after 60 seconds and returned output is capped.",
+      inputSchema: z.object({
+        command: z.string().trim().min(1).max(4_000),
+      }),
+      execute: async ({ command }) => {
+        const cwd = process.cwd();
+        const result = await runWorkspaceCommand(command);
+        const content = [
+          `exit code: ${result.exitCode ?? "unavailable"}`,
+          result.stdout ? `stdout:\n${result.stdout}` : "",
+          result.stderr ? `stderr:\n${result.stderr}` : "",
+          result.error ? `error: ${result.error}` : "",
+        ].filter(Boolean).join("\n");
+        await logActivity(ctx, {
+          type: "command",
+          title: `command ${result.ok ? "completed" : "failed"}: ${command}`,
+          content,
+          data: { command, cwd, exit_code: result.exitCode, ok: result.ok },
+        });
+        emitEvent({
+          type: "activity",
+          taskId: ctx.task.id,
+          payload: { title: `command ${result.ok ? "completed" : "failed"}` },
+        });
+        return result;
+      },
+  });
+}
+
+export function createPythonTools(ctx: RunContext) {
+  return {
+    write_python_file: tool({
+      description:
+        "Create or replace a Python source file in agent-python inside the workspace. No per-run approval is required. Only a simple .py filename is accepted; source is limited to 64 KB.",
+      inputSchema: z.object({
+        file_name: z.string().min(4).max(104),
+        source: z.string().max(64_000),
+      }),
+      execute: async ({ file_name, source }) => {
+        const relativePath = await writeWorkspacePythonFile(file_name, source);
+        await logActivity(ctx, {
+          type: "python_file",
+          title: `Python file written: ${relativePath}`,
+          content: source.slice(0, 4_000),
+          data: { file_name: relativePath, source_length: source.length },
+        });
+        return { ok: true, file: relativePath, source_length: source.length };
+      },
+    }),
+    run_python_file: tool({
+      description:
+        "Run a Python file previously created in agent-python inside the workspace. No per-run approval is required. Execution has a 60-second timeout and returned output is capped; it is not sandboxed.",
+      inputSchema: z.object({ file_name: z.string().min(4).max(104) }),
+      execute: async ({ file_name }) => {
+        const result = await runWorkspacePythonFile(file_name);
+        const content = [
+          `exit code: ${result.exitCode ?? "unavailable"}`,
+          result.stdout ? `stdout:\n${result.stdout}` : "",
+          result.stderr ? `stderr:\n${result.stderr}` : "",
+          result.error ? `error: ${result.error}` : "",
+        ].filter(Boolean).join("\n");
+        await logActivity(ctx, {
+          type: "python_run",
+          title: `Python script ${result.ok ? "completed" : "failed"}: ${file_name}`,
+          content,
+          data: {
+            file_name,
+            cwd: result.cwd,
+            exit_code: result.exitCode,
+            ok: result.ok,
+          },
+        });
+        return result;
+      },
+    }),
+  };
+}
+
+export async function buildMcpAgentTools(ctx: RunContext, target: McpAgentTarget) {
+  const servers = (await listMcpServers()).filter((server) => server.agent_target === target);
+  const tools = servers.flatMap((server) =>
+    server.tools.map((descriptor, index) => {
+      const safeToolName = descriptor.name.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 48);
+      const toolName = `mcp_${server.id}_${index + 1}_${safeToolName || "tool"}`;
+      const approvalTool = `mcp:${server.id}:${descriptor.name}`;
+      const schemaDescription = JSON.stringify(descriptor.inputSchema).slice(0, 4_000);
+      return [
+        toolName,
+        tool({
+          description: [
+            `Call ${descriptor.name} on the MCP server "${server.name}".`,
+            descriptor.description ?? "",
+            `Input JSON Schema: ${schemaDescription}`,
+            "This call requires operator approval before it is sent.",
+          ].filter(Boolean).join("\n"),
+          inputSchema: z.record(z.string(), z.unknown()),
+          execute: async (args) => {
+            const approval = await repo.createApproval({
+              taskId: ctx.task.id,
+              intentId: ctx.intentId ?? null,
+              tool: approvalTool,
+              args: {
+                server_id: server.id,
+                server_name: server.name,
+                tool_name: descriptor.name,
+                arguments: args,
+              },
+              reason: `MCP tool call to ${server.name}.${descriptor.name} requires explicit operator approval.`,
+              status: "pending",
+            });
+            if (ctx.intentId) await repo.updateNodeStatus(ctx.intentId, "awaiting_approval");
+            emitEvent({
+              type: "approval",
+              taskId: ctx.task.id,
+              payload: { approvalId: approval.id, tool: approvalTool },
+            });
+
+            const decision = await waitForApproval(ctx.task.id, approval.id);
+            if (decision !== "approved") {
+              if (decision !== "denied") {
+                await repo.setApprovalStatus(approval.id, "denied");
+              }
+              const reason = decision === "denied"
+                ? "Operator denied the MCP call; it was not sent."
+                : decision === "timed_out"
+                  ? "MCP call approval timed out; the call was not sent."
+                  : "The task stopped before MCP call approval; the call was not sent.";
+              await logActivity(ctx, {
+                type: "mcp",
+                title: `MCP call not sent: ${server.name}.${descriptor.name}`,
+                content: reason,
+                data: { server_id: server.id, tool_name: descriptor.name, approval_id: approval.id, decision },
+              });
+              return { status: decision, error: reason };
+            }
+
+            try {
+              const result = await callMcpTool(server, descriptor.name, args);
+              await logActivity(ctx, {
+                type: "mcp",
+                title: `MCP call completed: ${server.name}.${descriptor.name}`,
+                content: JSON.stringify(result).slice(0, 4_000),
+                data: { server_id: server.id, tool_name: descriptor.name, approval_id: approval.id },
+              });
+              return result;
+            } catch (error) {
+              await logActivity(ctx, {
+                type: "error",
+                title: `MCP call failed: ${server.name}.${descriptor.name}`,
+                content: error instanceof Error ? error.message : String(error),
+                data: { server_id: server.id, tool_name: descriptor.name, approval_id: approval.id },
+              });
+              throw error;
+            }
+          },
+        }),
+      ] as const;
+    }),
+  );
+  return Object.fromEntries(tools);
 }
 
 /* ------------------------------------------------------------------ */
@@ -89,14 +298,179 @@ export async function graphOverview(taskId: number) {
     .filter((n) => n.kind === "intent" && ["pending", "running", "blocked", "awaiting_approval"].includes(n.status))
     .map((n) => ({ id: n.id, title: n.title, status: n.status }));
   const facts = nodes.filter((n) => n.kind === "fact").slice(0, 10).map((n) => ({ id: n.id, title: n.title }));
-  const findings = nodes.filter((n) => n.kind === "finding").map((n) => ({ id: n.id, title: n.title }));
+  const findings = (await repo.listFindings(taskId)).slice(0, 30).map((finding) => ({
+    id: finding.id,
+    title: finding.title,
+    severity: finding.severity,
+    status: finding.status,
+    validator_status: finding.validator_status,
+    validator_result: finding.validator_result,
+    asset_id: finding.asset_id,
+    location: finding.location,
+  }));
+  const workerUpdates = (await repo.listActivity(taskId, 120))
+    .filter((entry) => entry.intent_id !== null)
+    .slice(-30)
+    .map((entry) => ({
+      intent_id: entry.intent_id,
+      role: entry.role,
+      type: entry.type,
+      title: entry.title,
+      content: (entry.content ?? "").slice(0, 1200),
+    }));
   const goal = nodes.find((n) => n.kind === "goal");
-  return { counts, openIntents, recentFacts: facts, findings, goal: goal ? { id: goal.id, status: goal.status, title: goal.title } : null };
+  return {
+    counts,
+    openIntents,
+    recentFacts: facts,
+    findings,
+    workerUpdates,
+    goal: goal ? { id: goal.id, status: goal.status, title: goal.title } : null,
+  };
+}
+
+export async function plannerAssessmentSnapshot(taskId: number) {
+  const [nodes, edges, scope, findings, activity] = await Promise.all([
+    repo.listNodes(taskId, undefined, 1000),
+    repo.listEdges(taskId),
+    repo.listScopeAssets(taskId),
+    repo.listFindings(taskId),
+    repo.listActivity(taskId, 120),
+  ]);
+  const anchors = await repo.listAnchorsForNodes(nodes.map((node) => node.id));
+  const anchorsByNode = new Map<number, number[]>();
+  for (const anchor of anchors) {
+    const assetIds = anchorsByNode.get(anchor.node_id) ?? [];
+    assetIds.push(anchor.asset_id);
+    anchorsByNode.set(anchor.node_id, assetIds);
+  }
+  const scopeIds = new Set(scope.map((asset) => asset.id));
+  const nodesById = new Map(nodes.map((node) => [node.id, node]));
+  const workerResults = activity
+    .filter((entry) => entry.intent_id !== null)
+    .slice(-40)
+    .map((entry) => ({
+      intent_id: entry.intent_id,
+      intent_title: nodesById.get(entry.intent_id!)?.title ?? null,
+      role: entry.role,
+      type: entry.type,
+      title: entry.title,
+      content: (entry.content ?? "").slice(0, 1600),
+    }));
+
+  return {
+    explorationGraph: {
+      nodes: nodes.map((node) => ({
+        id: node.id,
+        kind: node.kind,
+        title: node.title,
+        status: node.status,
+        content: node.content,
+        data: node.data,
+      })),
+      edges,
+      anchors: nodes.map((node) => ({
+        node_id: node.id,
+        asset_ids: anchorsByNode.get(node.id) ?? [],
+      })),
+    },
+    assetGraph: {
+      nodes: scope.map((asset) => ({
+        id: asset.id,
+        kind: asset.kind,
+        value: asset.value,
+        parent_id: asset.parent_id,
+      })),
+      edges: scope
+        .filter((asset) => asset.parent_id !== null && scopeIds.has(asset.parent_id))
+        .map((asset) => ({
+          from_id: asset.parent_id,
+          to_id: asset.id,
+          relation: "parent_of",
+        })),
+    },
+    findings: findings.map((finding) => ({
+      id: finding.id,
+      title: finding.title,
+      severity: finding.severity,
+      status: finding.status,
+      validator_status: finding.validator_status,
+      validator_result: finding.validator_result,
+      asset_id: finding.asset_id,
+      location: finding.location,
+      description: finding.description,
+      evidence: (finding.evidence ?? "").slice(0, 1600),
+      observed_payload: finding.observed_payload,
+      observed_result: finding.observed_result,
+    })),
+    workerResults,
+  };
 }
 
 /* ------------------------------------------------------------------ */
 /* Planner tools                                                       */
 /* ------------------------------------------------------------------ */
+
+interface PlannerIntentInput {
+  title: string;
+  description: string;
+  asset_ids: number[];
+}
+
+async function createPlannerIntent(ctx: RunContext, input: PlannerIntentInput) {
+  const { title, description, asset_ids } = input;
+  const task = await repo.getTask(ctx.task.id);
+  if (!task?.todolist?.length) {
+    return {
+      created: false,
+      reason: "create the task's phased todolist first; dispatch work on the next planner turn",
+    };
+  }
+  const nodes = await repo.listNodes(ctx.task.id, "intent", 1000);
+  const scope = await repo.listScopeAssets(ctx.task.id);
+  if (asset_ids.some((assetId) => !scope.some((asset) => asset.id === assetId))) {
+    return { created: false, reason: "intents may only target assets in the task's explicit scope" };
+  }
+  if (/^Solver (XSS|SQLi|XXE):/.test(title)) {
+    if (asset_ids.length !== 1) {
+      return { created: false, reason: "specialist solver intents must target exactly one asset" };
+    }
+    const asset = await repo.getAsset(asset_ids[0]!);
+    if (!asset || (asset.kind !== "endpoint" && !/^https?:\/\//i.test(asset.value))) {
+      return { created: false, reason: "specialist solver intents must target an HTTP endpoint" };
+    }
+  }
+  for (const node of nodes) {
+    if (node.status === "failed" || node.title !== title) continue;
+    const anchored = await repo.listAnchoredAssetIds(node.id);
+    if (asset_ids.every((assetId) => anchored.includes(assetId))) {
+      return {
+        created: false,
+        intent_id: node.id,
+        reason: "an intent with this title and scope already exists; review its result instead of duplicating it",
+      };
+    }
+  }
+  const node = await repo.createNode({
+    taskId: ctx.task.id,
+    kind: "intent",
+    title,
+    content: description,
+    status: "pending",
+    data: { source: "planner" },
+  });
+  await repo.addAnchor(node.id, asset_ids);
+  const goal = (await repo.listNodes(ctx.task.id, "goal", 1))[0];
+  if (goal) await repo.addEdge(ctx.task.id, goal.id, node.id, "spawns");
+  await logActivity(ctx, {
+    type: "intent_sent",
+    title: `planner dispatched intent #${node.id}: ${title}`,
+    content: description,
+    data: { asset_ids },
+  });
+  emitEvent({ type: "intent", taskId: ctx.task.id, payload: { intentId: node.id, title } });
+  return { created: true, intent_id: node.id };
+}
 
 export function buildPlannerTools(ctx: RunContext) {
   return {
@@ -147,61 +521,38 @@ export function buildPlannerTools(ctx: RunContext) {
         return { ok: true, items };
       },
     }),
-    search_assets: tool({
-      description: "Search the global asset graph by value (domain, ip, endpoint) or kind.",
-      inputSchema: z.object({
-        query: z.string().optional(),
-        kind: z.enum(ASSET_KINDS).optional(),
-      }),
-      execute: async ({ query, kind }) => {
-        const assets = await repo.listAssets({ search: query, kind });
-        return assets.slice(0, 50).map((a) => ({ id: a.id, kind: a.kind, value: a.value }));
-      },
-    }),
     send_intent: tool({
       description:
-        "Send a single new intent into the frontier. Only send an intent when there is an uncovered direction; most wakes should send none. Each intent is claimed by exactly one worker.",
+        "Send one bounded worker objective anchored to explicitly in-scope assets. Prefer dispatch_agents to create a parallel batch of independent specialist work.",
       inputSchema: z.object({
         title: z.string().describe("Short imperative title, e.g. 'Enumerate subdomains of example.com'"),
         description: z.string().describe("What the worker should determine and why it advances the goal."),
         asset_ids: z.array(z.number()).min(1).describe("Assets this direction probes; these anchor the intent."),
       }),
-      execute: async ({ title, description, asset_ids }) => {
-        const nodes = await repo.listNodes(ctx.task.id, "intent", 1000);
-        let existing = null;
-        for (const node of nodes) {
-          const anchored = await repo.listAnchoredAssetIds(node.id);
-          if (anchored.some((assetId) => asset_ids.includes(assetId))) {
-            existing = node;
-            break;
-          }
-        };
-        if (existing) {
-          return {
-            created: false,
-            intent_id: existing.id,
-            reason: "an intent already probes one of these assets; wait for it instead of duplicating",
-          };
+      execute: async (input) => createPlannerIntent(ctx, input),
+    }),
+    dispatch_agents: tool({
+      description:
+        "Dispatch 1-8 independent specialist worker intents in one batch. Use distinct roles such as Discovery, Authentication/Authorization, Input/SSRF, or Business Logic when relevant. Anchor each to relevant in-scope assets. The engine runs the batch concurrently up to the task concurrency setting.",
+      inputSchema: z.object({
+        intents: z.array(z.object({
+          title: z.string().trim().min(1).max(200),
+          description: z.string().trim().min(1).max(4000),
+          asset_ids: z.array(z.number().int().positive()).min(1).max(20),
+        })).min(1).max(8),
+      }),
+      execute: async ({ intents }) => {
+        const results = [];
+        for (const intent of intents) {
+          results.push(await createPlannerIntent(ctx, intent));
         }
-        const node = await repo.createNode({
-          taskId: ctx.task.id,
-          kind: "intent",
-          title,
-          content: description,
-          status: "pending",
-          data: { source: "planner" },
-        });
-        await repo.addAnchor(node.id, asset_ids);
-        const goal = (await repo.listNodes(ctx.task.id, "goal", 1))[0];
-        if (goal) await repo.addEdge(ctx.task.id, goal.id, node.id, "spawns");
+        const dispatched = results.filter((result) => result.created).length;
         await logActivity(ctx, {
-          type: "intent_sent",
-          title: `planner sent intent #${node.id}: ${title}`,
-          content: description,
-          data: { asset_ids },
+          type: "dispatch",
+          title: `planner dispatched ${dispatched}/${intents.length} specialist intents`,
+          data: { results },
         });
-        emitEvent({ type: "intent", taskId: ctx.task.id, payload: { intentId: node.id, title } });
-        return { created: true, intent_id: node.id };
+        return { dispatched, requested: intents.length, results };
       },
     }),
     prove_goal: tool({
@@ -237,6 +588,8 @@ async function intentAssets(intentId: number): Promise<Asset[]> {
 
 export function buildWorkerTools(ctx: RunContext) {
   return {
+    execute_cmd: createCommandExecutionTool(ctx),
+    ...createPythonTools(ctx),
     get_intent_context: tool({
       description: "Read this worker's claimed intent, its anchored assets and the current in-scope assets.",
       inputSchema: z.object({}),
@@ -281,97 +634,253 @@ export function buildWorkerTools(ctx: RunContext) {
         return filtered.map((s) => ({ id: s.id, step: s.step, title: s.title, content: s.content }));
       },
     }),
-    run_recon: tool({
+    validate_finding: tool({
       description:
-        "Run a reconnaissance technique against one in-scope asset (LOCAL SIMULATION in this edition — no network traffic is generated). Returns observations and discovered assets.",
+        "Validate a potential finding with one bounded GET probe. Supply an existing finding_id or create an unverified candidate by supplying its in-scope asset_id. The validator crafts the payload, records the candidate and result, and always waits for manual operator approval. SQL syntax-error responses can confirm SQL injection; reflected-XSS canaries are only potential because script execution is never performed.",
       inputSchema: z.object({
-        asset_id: z.number(),
-        technique: z.enum(RECON_TECHNIQUES),
+        finding_id: z.number().int().positive().optional(),
+        asset_id: z.number().int().positive().optional(),
+        type: z.enum(VALIDATOR_TYPES),
+        parameter: z.string().trim().min(1).max(64),
       }),
-      execute: async ({ asset_id, technique }) => {
-        const guardResult = await guard(ctx, "run_recon", { asset_id, technique });
-        if (!guardResult.approved) {
+      execute: async ({ finding_id, asset_id, type, parameter }) => {
+        if (process.env.AEGISMIND_ENABLE_LIVE_VALIDATION !== "true") {
+          return { error: "Live validation is disabled. Set AEGISMIND_ENABLE_LIVE_VALIDATION=true to enable approved probes." };
+        }
+        let finding = finding_id ? await repo.getFinding(finding_id) : undefined;
+        if (finding_id && (!finding || finding.task_id !== ctx.task.id || !finding.asset_id)) {
+          return { error: "The finding must belong to this task and reference an in-scope endpoint." };
+        }
+        if (!finding && !asset_id) {
+          return { error: "Provide either a task finding_id or an in-scope asset_id for a new candidate." };
+        }
+        if (finding && asset_id !== undefined && finding.asset_id !== asset_id) {
+          return { error: "The supplied asset_id does not match the finding's endpoint." };
+        }
+        const candidateAssetId = finding?.asset_id ?? asset_id;
+        if (candidateAssetId === undefined) {
+          return { error: "An in-scope endpoint asset is required." };
+        }
+        const asset = await repo.getAsset(candidateAssetId);
+        const scope = await repo.listScopeAssets(ctx.task.id);
+        const anchoredIds = ctx.intentId ? await repo.listAnchoredAssetIds(ctx.intentId) : [];
+        if (
+          !asset ||
+          asset.kind !== "endpoint" ||
+          !scope.some((entry) => entry.id === asset.id) ||
+          (ctx.intentId !== undefined && !anchoredIds.includes(asset.id))
+        ) {
           return {
-            pending_approval: true,
-            approval_id: guardResult.approvalId ?? guardResult.denialId,
-            message: guardResult.denialId
-              ? "This tool call was denied by the operator; record what you can and finish the intent."
-              : "Execution is blocked pending manual approval.",
+            error: ctx.intentId
+              ? "The endpoint must be explicitly in scope and anchored to this intent."
+              : "The endpoint must be explicitly in scope for this task.",
           };
         }
-        const asset = await repo.getAsset(asset_id);
-        if (!asset) return { error: `asset ${asset_id} not found` };
-        const result = simulateRecon({ taskId: ctx.task.id, intentId: ctx.intentId!, asset, technique: technique as Technique });
+
+        let target: URL;
+        try {
+          target = new URL(asset.value);
+        } catch {
+          return { error: "The in-scope endpoint is not a valid absolute URL." };
+        }
+        if (target.protocol !== "http:" && target.protocol !== "https:") {
+          return { error: "Only HTTP and HTTPS endpoint assets can be validated." };
+        }
+        if (target.username || target.password || target.hash) {
+          return { error: "Endpoint URLs cannot include credentials or fragments." };
+        }
+        if (target.toString().length > 2_048) {
+          return { error: "Endpoint URLs cannot exceed 2,048 characters." };
+        }
+        if (!/^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/.test(parameter)) {
+          return { error: "The query parameter name is invalid." };
+        }
+        const endpointLocation = `${target.origin}${target.pathname}`;
+        let createdCandidate = false;
+        if (!finding) {
+          const title = `${type === "reflected_xss" ? "Reflected XSS" : "SQL error injection"} candidate (${parameter}) at ${endpointLocation}`;
+          finding = (await repo.listFindings(ctx.task.id)).find(
+            (entry) => entry.asset_id === asset.id && entry.title === title,
+          );
+          if (!finding) {
+            const description =
+              type === "reflected_xss"
+                ? "Potential reflected script injection candidate; validation is required before confirming XSS."
+                : "Potential SQL error-injection candidate; validation is required before confirming SQL injection.";
+            const node = await repo.createNode({
+              taskId: ctx.task.id,
+              kind: "finding",
+              title,
+              content: description,
+              status: "done",
+              data: { severity: "medium", validator_type: type, validator_parameter: parameter },
+            });
+            await repo.addAnchor(node.id, [asset.id]);
+            if (ctx.intentId) await repo.addEdge(ctx.task.id, ctx.intentId, node.id, "yields");
+            finding = await repo.createFinding({
+              taskId: ctx.task.id,
+              assetId: asset.id,
+              nodeId: node.id,
+              title,
+              severity: "medium",
+              description,
+              reproduction: `Send a GET request to ${endpointLocation} with query parameter "${parameter}" set to the validator-generated payload.`,
+              location: `${endpointLocation} query parameter "${parameter}"`,
+              impact:
+                type === "reflected_xss"
+                  ? "If the reflected value executes as script in a browser, an attacker may run code in a victim's session."
+                  : "If the parameter is interpreted as SQL, an attacker may affect the application's database query.",
+              evidence: "Unverified candidate created for a bounded validator probe; this is not proof of a vulnerability.",
+            });
+            createdCandidate = true;
+          }
+        }
+        if (!["unverified", "awaiting_approval"].includes(finding.validator_status)) {
+          return {
+            finding_id: finding.id,
+            status: finding.validator_status,
+            result: finding.validator_result,
+            message: "This finding already has a validation result; create a new finding to run a separate check.",
+          };
+        }
+        const payload = craftValidationPayload({
+          taskId: ctx.task.id,
+          intentId: ctx.intentId ?? 0,
+          findingId: finding.id,
+          parameter,
+          type,
+        });
+        const approvalUrl = new URL(target);
+        for (const name of new Set(approvalUrl.searchParams.keys())) {
+          if (name !== parameter) approvalUrl.searchParams.set(name, "[redacted]");
+        }
+        approvalUrl.searchParams.set(parameter, payload);
+        const toolKey = `validate_finding_${finding.id}_${type}_${parameter}`;
+        await repo.recordFindingValidation({
+          findingId: finding.id,
+          type,
+          parameter,
+          payload,
+          status: "awaiting_approval",
+          result: "Waiting for manual approval; no request has been sent.",
+        });
+        emitEvent({
+          type: "finding",
+          taskId: ctx.task.id,
+          payload: { findingId: finding.id, validationStatus: "awaiting_approval" },
+        });
+        const approval = await guard(
+          ctx,
+          toolKey,
+          {
+            finding_id: finding.id,
+            asset_id: asset.id,
+            endpoint: `${target.origin}${target.pathname}`,
+            method: "GET",
+            type,
+            parameter,
+            payload,
+            request_url: approvalUrl.toString(),
+          },
+          true,
+        );
+        if (!approval.approved) {
+          const decision = approval.denialId
+            ? "denied"
+            : approval.approvalId
+              ? await waitForApproval(ctx.task.id, approval.approvalId)
+              : "cancelled";
+          if (decision !== "approved") {
+            if (approval.approvalId && decision !== "denied") {
+              await repo.setApprovalStatus(approval.approvalId, "denied");
+              emitEvent({
+                type: "approval",
+                taskId: ctx.task.id,
+                payload: { approvalId: approval.approvalId, status: "denied" },
+              });
+            }
+            const result =
+              decision === "denied"
+                ? "The operator denied this validation; no request was sent."
+                : decision === "timed_out"
+                  ? "Approval was not received within five minutes; no request was sent."
+                  : "The task stopped before approval; no request was sent.";
+            await repo.recordFindingValidation({
+              findingId: finding.id,
+              type,
+              parameter,
+              payload,
+              status: decision === "denied" ? "denied" : "inconclusive",
+              result,
+            });
+            emitEvent({
+              type: "finding",
+              taskId: ctx.task.id,
+              payload: { findingId: finding.id, validationStatus: decision },
+            });
+            return { finding_id: finding.id, status: decision, result };
+          }
+        }
+
+        let verdict: "confirmed" | "potential" | "not_confirmed" | "inconclusive" | "blocked";
+        let result: string;
+        let status: number | null = null;
+        try {
+          const response = await sendValidationProbe(target, type, payload, parameter);
+          status = response.status;
+          const assessment = assessValidationResponse(type, payload, response);
+          verdict = assessment.verdict;
+          result = `${assessment.result}${response.truncated ? " Response body was truncated." : ""}`;
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          verdict = /private or reserved|Metadata and link-local|Non-standard ports require/i.test(message)
+            ? "blocked"
+            : "inconclusive";
+          result = `No vulnerability verdict: ${message}`;
+        }
+        const validatedDescription = createdCandidate
+          ? verdict === "confirmed"
+            ? "SQL injection confirmed: the single-quote probe triggered a recognized database syntax-error signature."
+            : verdict === "potential"
+              ? "Potential reflected XSS: the inert script canary was reflected in HTML; script execution was not tested."
+              : `Potential issue not confirmed by the safe ${type === "sql_error" ? "SQL syntax-error" : "reflected-XSS"} probe.`
+          : undefined;
+        await repo.recordFindingValidation({
+          findingId: finding.id,
+          type,
+          parameter,
+          payload,
+          status: verdict,
+          result,
+          description: validatedDescription,
+        });
+        if (verdict === "confirmed" && finding.node_id && ctx.intentId) {
+          const edges = await repo.listEdges(ctx.task.id);
+          const alreadyProven = edges.some(
+            (edge) =>
+              edge.from_id === ctx.intentId &&
+              edge.to_id === finding.node_id &&
+              edge.relation === "proves",
+          );
+          if (!alreadyProven) await repo.addEdge(ctx.task.id, ctx.intentId, finding.node_id, "proves");
+        }
+        await repo.addTraffic({
+          taskId: ctx.task.id,
+          intentId: ctx.intentId ?? null,
+          method: "GET",
+          url: approvalUrl.toString(),
+          status,
+          request: `GET ${target.origin}${target.pathname} with query parameter ${parameter}=${payload}; other query values redacted.`,
+          response: result,
+        });
         await logActivity(ctx, {
-          type: "tool_result",
-          title: `run_recon(${technique}) on ${asset.value}`,
-          content: result.observations.join("\n"),
-          data: { technique, asset_id, observations: result.observations },
+          type: "validation",
+          title: `validator ${verdict}: finding #${finding.id}`,
+          content: result,
+          data: { finding_id: finding.id, type, parameter, payload, status },
         });
-        await repo.addTraffic({
-          taskId: ctx.task.id,
-          intentId: ctx.intentId ?? null,
-          method: result.traffic.method,
-          url: result.traffic.url,
-          status: result.traffic.status,
-          request: result.traffic.request,
-          response: result.traffic.response,
-        });
-        emitEvent({ type: "traffic", taskId: ctx.task.id, payload: { url: result.traffic.url } });
-        return {
-          technique,
-          asset: asset.value,
-          observations: result.observations,
-          discovered: result.assets,
-          signal: result.finding ?? null,
-        };
-      },
-    }),
-    dns_lookup: tool({
-      description: "Resolve a hostname to addresses (LOCAL SIMULATION — offline).",
-      inputSchema: z.object({ name: z.string() }),
-      execute: async ({ name }) => {
-        const guardResult = await guard(ctx, "dns_lookup", { name });
-        if (!guardResult.approved) {
-          return { pending_approval: true, approval_id: guardResult.approvalId ?? guardResult.denialId };
-        }
-        const companyId = (await repo.listScopeAssets(ctx.task.id))[0]?.company_id ?? null;
-        const { asset } = await repo.upsertAsset({ companyId, kind: "subdomain", value: name });
-        const result = simulateRecon({ taskId: ctx.task.id, intentId: ctx.intentId!, asset, technique: "dns" });
-        await logActivity(ctx, { type: "tool_result", title: `dns_lookup(${name})`, content: result.observations.join("\n") });
-        await repo.addTraffic({
-          taskId: ctx.task.id,
-          intentId: ctx.intentId ?? null,
-          method: "DNS",
-          url: `dns://${name}`,
-          status: 0,
-          request: `# simulated dns lookup\nname: ${name}`,
-          response: result.observations.join("\n"),
-        });
-        return { name, observations: result.observations, discovered: result.assets };
-      },
-    }),
-    http_probe: tool({
-      description: "Send an HTTP request to an in-scope endpoint (LOCAL SIMULATION — offline).",
-      inputSchema: z.object({ url: z.string(), method: z.string().optional() }),
-      execute: async ({ url, method }) => {
-        const guardResult = await guard(ctx, "http_probe", { url, method });
-        if (!guardResult.approved) {
-          return { pending_approval: true, approval_id: guardResult.approvalId ?? guardResult.denialId };
-        }
-        const { asset } = await repo.upsertAsset({ companyId: null, kind: "endpoint", value: url });
-        const result = simulateRecon({ taskId: ctx.task.id, intentId: ctx.intentId!, asset, technique: "http" });
-        await logActivity(ctx, { type: "tool_result", title: `http_probe ${method ?? "GET"} ${url}`, content: result.observations.join("\n") });
-        await repo.addTraffic({
-          taskId: ctx.task.id,
-          intentId: ctx.intentId ?? null,
-          method: method ?? "GET",
-          url,
-          status: result.traffic.status,
-          request: result.traffic.request,
-          response: result.traffic.response,
-        });
-        return { url, status: result.traffic.status, observations: result.observations, signal: result.finding ?? null };
+        emitEvent({ type: "finding", taskId: ctx.task.id, payload: { findingId: finding.id, validationStatus: verdict } });
+        return { finding_id: finding.id, type, parameter, payload, status: verdict, result };
       },
     }),
     submit_asset: tool({
@@ -387,7 +896,20 @@ export function buildWorkerTools(ctx: RunContext) {
         const parent = parent_id ? await repo.getAsset(parent_id) : undefined;
         const companyId = parent?.company_id ?? (await repo.listScopeAssets(ctx.task.id))[0]?.company_id ?? null;
         const { asset, created } = await repo.upsertAsset({ companyId, kind, value, parentId: parent_id ?? null, attributes });
-        if (created && kind !== "endpoint") await repo.addTaskScope(ctx.task.id, [asset.id]);
+        if (parent_id && parent) {
+          const scope = await repo.listScopeAssets(ctx.task.id);
+          const parentIsInScope = scope.some((scopedAsset) => scopedAsset.id === parent_id);
+          const parentHost = extractHost(parent.value).toLowerCase();
+          const discoveredHost = extractHost(value).toLowerCase();
+          const sameHost = parentHost === discoveredHost;
+          const inParentDomain = kind === "subdomain" &&
+            (sameHost || discoveredHost.endsWith(`.${parentHost}`));
+          const scopedEndpoint = kind === "endpoint" && sameHost;
+          const scopedService = kind === "service" && sameHost;
+          if (parentIsInScope && (scopedEndpoint || (created && (inParentDomain || scopedService)))) {
+            await repo.addTaskScope(ctx.task.id, [asset.id]);
+          }
+        }
         await logActivity(ctx, {
           type: "asset",
           title: `${created ? "new" : "known"} asset ${kind} ${value}`,
@@ -405,17 +927,25 @@ export function buildWorkerTools(ctx: RunContext) {
         anchor_asset_ids: z.array(z.number()).optional(),
       }),
       execute: async ({ title, content, anchor_asset_ids }) => {
+        const scopeIds = new Set((await repo.listScopeAssets(ctx.task.id)).map((asset) => asset.id));
+        const intentAssetIds = ctx.intentId ? await repo.listAnchoredAssetIds(ctx.intentId) : [];
+        const anchorIds = anchor_asset_ids?.length
+          ? anchor_asset_ids
+          : intentAssetIds;
+        if (
+          anchorIds.length === 0 ||
+          anchorIds.some((id) => !scopeIds.has(id) || (ctx.intentId !== undefined && !intentAssetIds.includes(id)))
+        ) {
+          return { error: "Facts must be anchored to assets explicitly in scope and, for workers, to this intent." };
+        }
         const node = await repo.createNode({
           taskId: ctx.task.id,
           kind: "fact",
           title,
           content,
           status: "done",
-          data: { source_intent: ctx.intentId },
+          data: { source_intent: ctx.intentId ?? null },
         });
-        const anchorIds = anchor_asset_ids?.length
-          ? anchor_asset_ids
-          : (await intentAssets(ctx.intentId!)).map((a) => a.id);
         await repo.addAnchor(node.id, anchorIds);
         if (ctx.intentId) await repo.addEdge(ctx.task.id, ctx.intentId, node.id, "yields");
         await logActivity(ctx, { type: "fact", title: `fact: ${title}`, content });
@@ -424,26 +954,40 @@ export function buildWorkerTools(ctx: RunContext) {
       },
     }),
     submit_finding: tool({
-      description: "Record a vulnerability as both an exploration-graph finding node and a finding row.",
+      description:
+        "Record a potential vulnerability as an unverified finding with its supporting observation. Every field is mandatory: describe the suspected vulnerability, give safe reproduction steps, identify the exact affected location, explain potential attacker impact, and cite concrete evidence. If a safe in-scope test already produced a payload and response/result, optionally include them as observed_payload and observed_result; these are reported evidence, not proof of validator confirmation. After submitting, call validate_finding before treating the issue as confirmed. Never submit simulated signals as evidence.",
       inputSchema: z.object({
-        title: z.string(),
+        title: z.string().trim().min(1),
         severity: z.enum(SEVERITIES),
-        description: z.string(),
-        evidence: z.string().optional(),
+        description: z.string().trim().min(1).describe("Nature of the vulnerability."),
+        reproduction: z.string().trim().min(1).describe("Safe, concrete steps to trigger the vulnerability."),
+        location: z.string().trim().min(1).describe("Exact affected asset, URL/path, parameter, component, or code location."),
+        impact: z.string().trim().min(1).describe("What an attacker can achieve if the vulnerability is exploited."),
+        evidence: z.string().trim().min(1).describe("Required proof: concrete, sanitized tool observations that directly demonstrate this vulnerability; do not submit an unsupported hypothesis."),
+        observed_payload: z.string().trim().max(4096).optional().describe("Payload actually used during the reported observation. Stored for evidence only; it is not executed by this tool."),
+        observed_result: z.string().trim().max(8192).optional().describe("Sanitized response or result actually observed when using the payload. Stored for evidence only."),
         asset_id: z.number().optional(),
       }),
-      execute: async ({ title, severity, description, evidence, asset_id }) => {
+      execute: async ({ title, severity, description, reproduction, location, impact, evidence, observed_payload, observed_result, asset_id }) => {
+        const scopeIds = new Set((await repo.listScopeAssets(ctx.task.id)).map((asset) => asset.id));
+        const intentAssetIds = ctx.intentId ? await repo.listAnchoredAssetIds(ctx.intentId) : [];
+        const assetIds = asset_id !== undefined ? [asset_id] : intentAssetIds;
+        if (
+          assetIds.length === 0 ||
+          assetIds.some((id) => !scopeIds.has(id) || (ctx.intentId !== undefined && !intentAssetIds.includes(id)))
+        ) {
+          return { error: "Findings must reference assets explicitly in scope and, for workers, anchored to this intent." };
+        }
         const node = await repo.createNode({
           taskId: ctx.task.id,
           kind: "finding",
           title,
           content: description,
           status: "done",
-          data: { severity },
+          data: { severity, source_intent: ctx.intentId ?? null },
         });
-        const assetIds = asset_id ? [asset_id] : (await intentAssets(ctx.intentId!)).map((a) => a.id);
         await repo.addAnchor(node.id, assetIds);
-        if (ctx.intentId) await repo.addEdge(ctx.task.id, ctx.intentId, node.id, "proves");
+        if (ctx.intentId) await repo.addEdge(ctx.task.id, ctx.intentId, node.id, "yields");
         const finding = await repo.createFinding({
           taskId: ctx.task.id,
           assetId: assetIds[0] ?? null,
@@ -451,7 +995,12 @@ export function buildWorkerTools(ctx: RunContext) {
           title,
           severity,
           description,
+          reproduction,
+          location,
+          impact,
           evidence,
+          observedPayload: observed_payload,
+          observedResult: observed_result,
         });
         await logActivity(ctx, { type: "finding", title: `finding(${severity}): ${title}`, content: description });
         emitEvent({ type: "finding", taskId: ctx.task.id, payload: { findingId: finding.id, title, severity } });
@@ -469,4 +1018,9 @@ export function buildWorkerTools(ctx: RunContext) {
       },
     }),
   };
+}
+
+export function buildDeadlineValidationTools(ctx: RunContext) {
+  const workerTools = buildWorkerTools(ctx);
+  return { validate_finding: workerTools.validate_finding };
 }

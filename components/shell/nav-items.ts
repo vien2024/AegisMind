@@ -34,7 +34,7 @@ export const NAV_GROUPS: NavGroup[] = [
     items: [
       { href: "/llm", label: "LLM", icon: "cpu" },
       { href: "/agent", label: "Agent", icon: "bot", upstreamOnly: true },
-      { href: "/mcp", label: "MCP", icon: "server", upstreamOnly: true },
+      { href: "/mcp", label: "MCP", icon: "server" },
       { href: "/skill", label: "Skill", icon: "sparkles", upstreamOnly: true },
       { href: "/tool", label: "Tool", icon: "wrench", upstreamOnly: true },
       { href: "/notifications", label: "Notifications", icon: "bell", upstreamOnly: true },
@@ -63,7 +63,7 @@ export const UPSTREAM_SECTIONS: Record<string, { title: string; blurb: string }>
   },
   "/mcp": {
     title: "MCP",
-    blurb: "Upstream connects remote MCP servers over HTTP/SSE. This edition exposes a fixed local tool set instead.",
+    blurb: "Connect trusted MCP servers over Streamable HTTP or SSE and invoke tools explicitly.",
   },
   "/skill": {
     title: "Skill",
@@ -71,7 +71,7 @@ export const UPSTREAM_SECTIONS: Record<string, { title: string; blurb: string }>
   },
   "/tool": {
     title: "Tool",
-    blurb: "Upstream manages Kali tool bindings and custom Python scripts. This edition ships simulated tools only.",
+    blurb: "Upstream manages Kali tool bindings and custom Python scripts. General reconnaissance tools are not included in this edition.",
   },
   "/notifications": {
     title: "Notifications",

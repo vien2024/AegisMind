@@ -2,14 +2,14 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Icon } from "@/components/shell/icons";
 import { Badge, Empty, SectionHeading, SeverityBadge, StatusBadge } from "@/components/ui";
 import type { Finding } from "@/lib/types";
 
 type Row = Finding & { task_name: string | null; asset_value: string | null };
 
-const STATUS_OPTIONS = ["pending", "confirmed", "fixed", "false_positive", "accepted"];
+const STATUS_OPTIONS = ["pending", "potential", "confirmed", "fixed", "false_positive", "accepted"];
 const SEVERITIES = ["critical", "high", "medium", "low", "info"] as const;
 const SEVERITY_RANK: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
 
@@ -38,6 +38,18 @@ export function FindingsClient({
   const [sort, setSort] = useState("severity");
   const [expanded, setExpanded] = useState<number | null>(null);
   const [busy, setBusy] = useState<number | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const source = new EventSource("/api/events");
+    const refreshFindings = () => router.refresh();
+    source.addEventListener("finding", refreshFindings);
+    source.onerror = () => source.close();
+    return () => {
+      source.removeEventListener("finding", refreshFindings);
+      source.close();
+    };
+  }, [router]);
 
   const tasks = useMemo(() => {
     const map = new Map<number, string>();
@@ -53,7 +65,7 @@ export function FindingsClient({
       if (status !== "all" && finding.status !== status) return false;
       if (task !== "all" && String(finding.task_id) !== task) return false;
       if (query) {
-        const haystack = `${finding.title} ${finding.description ?? ""} ${finding.evidence ?? ""} ${finding.asset_value ?? ""}`.toLowerCase();
+        const haystack = `${finding.title} ${finding.description ?? ""} ${finding.reproduction ?? ""} ${finding.location ?? ""} ${finding.impact ?? ""} ${finding.evidence ?? ""} ${finding.asset_value ?? ""}`.toLowerCase();
         if (!haystack.includes(query.toLowerCase())) return false;
       }
       return true;
@@ -69,13 +81,24 @@ export function FindingsClient({
 
   async function update(id: number, patch: Record<string, unknown>) {
     setBusy(id);
-    await fetch(`/api/findings/${id}`, {
-      method: "PATCH",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(patch),
-    });
-    setBusy(null);
-    router.refresh();
+    setError(null);
+    try {
+      const response = await fetch(`/api/findings/${id}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(patch),
+      });
+      const result = (await response.json()) as { error?: string };
+      if (!response.ok) {
+        setError(result.error ?? "Finding update failed.");
+        return;
+      }
+      router.refresh();
+    } catch {
+      setError("Finding update failed because the server could not be reached.");
+    } finally {
+      setBusy(null);
+    }
   }
 
   return (
@@ -100,13 +123,19 @@ export function FindingsClient({
         }
       />
 
-      <div className="grid gap-3 sm:grid-cols-3 xl:grid-cols-6">
+      <div className="grid gap-3 sm:grid-cols-3 xl:grid-cols-7">
         <SummaryCard label="Total findings" value={findings.length} icon="bug" />
         <SummaryCard
           label="Pending"
           value={findings.filter((finding) => finding.status === "pending").length}
           icon="clock"
           tone="text-amber-600"
+        />
+        <SummaryCard
+          label="Potential"
+          value={findings.filter((finding) => finding.status === "potential").length}
+          icon="clock"
+          tone="text-orange-600"
         />
         {(["critical", "high", "medium", "low"] as const).map((entry) => (
           <SummaryCard
@@ -179,6 +208,7 @@ export function FindingsClient({
                 </button>
               ))}
             </div>
+            {error && <p role="alert" className="text-[11px] text-red-600">{error}</p>}
             <a className="btn" href="/api/findings/export" onClick={(event) => event.preventDefault()}>
               <Icon name="download" className="h-3.5 w-3.5" />
               Export
@@ -227,12 +257,33 @@ export function FindingsClient({
                         <div className="truncate text-[11px] text-muted">{finding.description}</div>
                       )}
                       <div className="mt-0.5 text-[10px] text-faint">
-                        Traffic evidence {finding.evidence ? "1 record" : "0 records"}
+                        Initial evidence {finding.evidence ? "recorded" : "not recorded"} · Validator{" "}
+                        {finding.validator_status.replace(/_/g, " ")}
                       </div>
-                      {expanded === finding.id && finding.evidence && (
-                        <pre className="mono mt-2 whitespace-pre-wrap rounded-md border border-border bg-subtle p-2 text-[10.5px] text-muted">
-                          {finding.evidence}
-                        </pre>
+                      {expanded === finding.id && (
+                        <div className="mt-2 space-y-2 text-[11px]">
+                          {[
+                            ["Description", finding.description],
+                            ["Reproduction", finding.reproduction],
+                            ["Location", finding.location],
+                            ["Impact", finding.impact],
+                            ["Evidence", finding.evidence],
+                            ["Observed payload", finding.observed_payload],
+                            ["Observed result", finding.observed_result],
+                            ["Validation type", finding.validator_type],
+                            ["Validation parameter", finding.validator_parameter],
+                            ["Validation payload", finding.validator_payload],
+                            ["Validation status", finding.validator_status.replace(/_/g, " ")],
+                            ["Exploit result", finding.validator_result],
+                          ].map(([label, value]) => (
+                            <div key={label}>
+                              <div className="font-medium text-ink">{label}</div>
+                              <pre className="mono whitespace-pre-wrap rounded-md border border-border bg-subtle p-2 text-[10.5px] text-muted">
+                                {value || "Not recorded"}
+                              </pre>
+                            </div>
+                          ))}
+                        </div>
                       )}
                     </td>
                     <td>
@@ -246,7 +297,11 @@ export function FindingsClient({
                         className="w-36! py-1! text-[11px]!"
                       >
                         {STATUS_OPTIONS.map((entry) => (
-                          <option key={entry} value={entry}>
+                          <option
+                            key={entry}
+                            value={entry}
+                            disabled={entry === "confirmed" && finding.validator_status !== "confirmed"}
+                          >
                             {entry.replace(/_/g, " ")}
                           </option>
                         ))}
@@ -268,6 +323,7 @@ export function FindingsClient({
                         <button
                           type="button"
                           className="btn px-2! py-1! text-[11px]!"
+                          disabled={finding.validator_status !== "confirmed" || busy === finding.id}
                           onClick={() => update(finding.id, { status: "confirmed" })}
                         >
                           <Icon name="checkCircle" className="h-3.5 w-3.5" />

@@ -34,5 +34,3 @@ export function ThemeToggle() {
     </button>
   );
 }
-
-export const THEME_BOOT_SCRIPT = `(function(){try{var t=localStorage.getItem('aegismind-theme');if(t==='dark'||t==='light'){document.documentElement.dataset.theme=t;}}catch(e){}})();`;

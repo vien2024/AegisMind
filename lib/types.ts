@@ -34,7 +34,7 @@ export const NODE_STATUSES = [
 ] as const;
 export type NodeStatus = (typeof NODE_STATUSES)[number];
 
-export const PROVIDERS = ["openai", "anthropic", "openrouter", "orcarouter", "mock"] as const;
+export const PROVIDERS = ["openai", "anthropic", "openrouter", "orcarouter", "mistral", "ollama", "mock"] as const;
 export type ProviderId = (typeof PROVIDERS)[number];
 
 export const LANGUAGES = ["en", "ko"] as const;
@@ -70,6 +70,7 @@ export interface Task {
   status: TaskStatus;
   language: Language;
   concurrency: number;
+  time_limit_minutes: number | null;
   auto_approve: number;
   todolist: TodoItem[] | null;
   error: string | null;
@@ -128,7 +129,18 @@ export interface Finding {
   severity: Severity;
   status: string;
   description: string | null;
+  reproduction: string | null;
+  location: string | null;
+  impact: string | null;
   evidence: string | null;
+  observed_payload: string | null;
+  observed_result: string | null;
+  validator_type: "reflected_xss" | "sql_error" | null;
+  validator_parameter: string | null;
+  validator_payload: string | null;
+  validator_status: "unverified" | "awaiting_approval" | "confirmed" | "potential" | "not_confirmed" | "inconclusive" | "denied" | "blocked";
+  validator_result: string | null;
+  validated_at: string | null;
   disposition: string | null;
   fix_version: string | null;
   created_at: string;

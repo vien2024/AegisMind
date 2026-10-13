@@ -51,6 +51,46 @@ const TEMPLATES: Template[] = [
     links: [{ label: "Create an API key", href: "https://console.anthropic.com/settings/keys" }],
   },
   {
+    id: "mistral-cloud",
+    label: "Mistral · Cloud API",
+    note: "Mistral models through the hosted API. Requires a Mistral API key.",
+    provider: "mistral",
+    model: "mistral-small-latest",
+    base_url: "https://api.mistral.ai/v1",
+    needsKey: true,
+    links: [{ label: "Create an API key", href: "https://console.mistral.ai/api-keys/" }],
+  },
+  {
+    id: "mistral-local",
+    label: "Mistral · Local server",
+    note: "Connect to a local Mistral-compatible OpenAI API server, such as mistral.rs. No API key is needed for localhost.",
+    provider: "mistral",
+    model: "mistral-small",
+    base_url: "http://localhost:1234/v1",
+    needsKey: false,
+    links: [{ label: "mistral.rs", href: "https://github.com/EricLBuehler/mistral.rs" }],
+  },
+  {
+    id: "ollama-cloud",
+    label: "Ollama · Cloud",
+    note: "Use a cloud-hosted Ollama model through Ollama's OpenAI-compatible API. Requires an Ollama API key.",
+    provider: "ollama",
+    model: "gpt-oss:20b-cloud",
+    base_url: "https://ollama.com/v1",
+    needsKey: true,
+    links: [{ label: "Ollama Cloud", href: "https://ollama.com/" }],
+  },
+  {
+    id: "ollama-local",
+    label: "Ollama · Local",
+    note: "Connect to the local Ollama server. No API key is needed; pull the model with Ollama before testing.",
+    provider: "ollama",
+    model: "llama3.2",
+    base_url: "http://localhost:11434/v1",
+    needsKey: false,
+    links: [{ label: "Ollama downloads", href: "https://ollama.com/download" }],
+  },
+  {
     id: "openrouter",
     label: "OpenRouter · multi-provider router",
     note: "One OpenAI-compatible endpoint for hundreds of models from many vendors (openai/…, anthropic/…, google/…). Model ids are vendor-prefixed; keys look like sk-or-v1-…. Requests are billed and rate-limited by OpenRouter.",
@@ -86,21 +126,13 @@ const TEMPLATES: Template[] = [
     needsKey: true,
     links: [{ label: "GLM-5.3 model guide", href: "https://docs.z.ai/" }],
   },
-  {
-    id: "mock",
-    label: "Offline simulator (no API key)",
-    note: "A deterministic local LanguageModelV4. The full AI SDK agent loop runs, with no network access and no credentials.",
-    provider: "mock",
-    model: "aegismind-simulator",
-    base_url: "",
-    needsKey: false,
-    links: [],
-  },
 ];
 
 const KEY_PLACEHOLDER: Partial<Record<ProviderId, string>> = {
   openrouter: "sk-or-v1-…",
   orcarouter: "sk-orca-…",
+  mistral: "Mistral API key",
+  ollama: "Ollama API key (cloud only)",
 };
 
 const KEY_HINT: Partial<Record<ProviderId, string>> = {
@@ -108,6 +140,8 @@ const KEY_HINT: Partial<Record<ProviderId, string>> = {
   anthropic: "Anthropic key (sk-ant-…).",
   openrouter: "OpenRouter key (sk-or-v1-…), or set OPENROUTER_API_KEY on the server.",
   orcarouter: "Orca Router key (sk-orca-…), or set ORCAROUTER_API_KEY on the server.",
+  mistral: "Mistral key (paste here or set MISTRAL_API_KEY).",
+  ollama: "Ollama Cloud key (paste here or set OLLAMA_API_KEY); local Ollama needs no key.",
 };
 
 export function LlmClient({
@@ -116,7 +150,7 @@ export function LlmClient({
   usageInitial,
 }: {
   configs: ConfigRow[];
-  env: { openai: boolean; anthropic: boolean; openrouter: boolean; orcarouter: boolean };
+  env: { openai: boolean; anthropic: boolean; openrouter: boolean; orcarouter: boolean; mistral: boolean; ollama: boolean };
   usageInitial: React.ComponentProps<typeof TokenUsageCard>["initial"];
 }) {
   const router = useRouter();
@@ -175,7 +209,7 @@ export function LlmClient({
     setTestOk(Boolean(payload.ok));
     setTestResult(
       payload.ok
-        ? `Connected in ${payload.latencyMs} ms${payload.live ? "" : " (offline simulator)"}`
+        ? `Connected in ${payload.latencyMs} ms`
         : (payload.error ?? "Connection failed"),
     );
   }
@@ -226,7 +260,7 @@ export function LlmClient({
     <>
       <SectionHeading
         title="LLM"
-        subtitle="Model profiles and token accounting"
+        subtitle="Live model profiles and token accounting · task agents never fall back to simulation"
         action={
           <button className="btn btn-primary" type="button" onClick={() => setSheetOpen(true)}>
             <Icon name="plus" className="h-3.5 w-3.5" />
@@ -270,8 +304,8 @@ export function LlmClient({
           <div className="card-body">
             {rows.length === 0 ? (
               <Empty icon="cpu">
-                No model profile yet. Agent runs currently use the offline simulator
-                {env.openai || env.anthropic || env.openrouter || env.orcarouter ? " or an environment key" : ""}.
+                No model profile yet. Configure and activate a live model before starting agent tasks.
+                {Object.values(env).some(Boolean) ? " A provider API key is available in the server environment." : ""}
               </Empty>
             ) : (
               <ul className="space-y-2">
@@ -280,7 +314,8 @@ export function LlmClient({
                     <div className="min-w-0 flex-1">
                       <div className="flex items-center gap-2">
                         <span className="truncate text-[13px] font-medium text-ink">{row.name}</span>
-                        {row.is_active === 1 && <Badge tone="running">active</Badge>}
+                        {row.is_active === 1 && row.provider !== "mock" && <Badge tone="running">active</Badge>}
+                        {row.provider === "mock" && <Badge tone="failed">simulator disabled</Badge>}
                         {row.has_key ? <Badge tone="completed">key set</Badge> : <Badge tone="neutral">no key</Badge>}
                       </div>
                       <div className="mono mt-0.5 truncate text-[11px] text-muted">
@@ -289,7 +324,7 @@ export function LlmClient({
                       </div>
                     </div>
                     <div className="flex items-center gap-1.5">
-                      {row.is_active !== 1 && (
+                      {row.is_active !== 1 && row.provider !== "mock" && (
                         <button className="btn px-2.5! py-1! text-[11px]!" type="button" onClick={() => activate(row.id)}>
                           Set active
                         </button>
@@ -381,7 +416,8 @@ export function LlmClient({
                     <option value="anthropic">Anthropic (Messages)</option>
                     <option value="openrouter">OpenRouter (OpenAI-compatible)</option>
                     <option value="orcarouter">Orca Router (OpenAI-compatible)</option>
-                    <option value="mock">Offline simulator</option>
+                    <option value="mistral">Mistral (OpenAI-compatible)</option>
+                    <option value="ollama">Ollama (OpenAI-compatible)</option>
                   </select>
                 </label>
               </div>
@@ -408,14 +444,17 @@ export function LlmClient({
                 <input
                   type="password"
                   value={form.apiKey}
-                  disabled={form.provider === "mock"}
-                  placeholder={form.provider === "mock" ? "—" : (KEY_PLACEHOLDER[form.provider] ?? "sk-…")}
+                  placeholder={
+                  template.provider === form.provider && !template.needsKey
+                      ? "Not required for local server"
+                      : (KEY_PLACEHOLDER[form.provider] ?? "sk-…")
+                }
                   onChange={(event) => setForm({ ...form, apiKey: event.target.value })}
                 />
                 <span className="block text-[11px] text-faint">
-                  {form.provider === "mock"
-                    ? "The offline simulator needs no credentials."
-                    : `${KEY_HINT[form.provider] ?? "Point Base URL at an OpenAI-compatible gateway."} Stored in the local SQLite database; never returned by the API.`}
+                  {template.provider === form.provider && !template.needsKey
+                      ? "Local server profile; no API key is required."
+                      : `${KEY_HINT[form.provider] ?? "Point Base URL at an OpenAI-compatible gateway."} Stored in the local SQLite database; never returned by the API.`}
                 </span>
               </label>
 

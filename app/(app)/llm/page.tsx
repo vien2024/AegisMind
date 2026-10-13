@@ -27,6 +27,8 @@ export default async function LlmPage() {
         anthropic: Boolean(process.env.ANTHROPIC_API_KEY),
         openrouter: Boolean(process.env.OPENROUTER_API_KEY),
         orcarouter: Boolean(process.env.ORCAROUTER_API_KEY),
+        mistral: Boolean(process.env.MISTRAL_API_KEY),
+        ollama: Boolean(process.env.OLLAMA_API_KEY),
       }}
       usageInitial={{
         range: "month",

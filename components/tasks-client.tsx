@@ -9,6 +9,30 @@ import type { Company, Task } from "@/lib/types";
 
 type TaskRow = Task & { counts: Record<string, number>; findings: number };
 
+const TASK_TEMPLATES = [
+  { id: "custom", label: "Custom task", name: "", goal: "" },
+  {
+    id: "full-pentest",
+    label: "Full authorized assessment",
+    name: "Full pentest",
+    goal: [
+      "Conduct a comprehensive security assessment of only the target and assets explicitly in this task's scope. Do not expand scope to third parties or newly discovered assets without explicit authorization.",
+      "",
+      "Maintain a phased checklist in the task todolist:",
+      "1. Confirm scope, authorization assumptions, constraints, and unknowns.",
+      "2. Recon explicitly authorized in-scope assets using the available shell and Python tools; choose appropriate non-destructive techniques and record concrete command output and observations.",
+      "3. Assess common web/API risk areas: authentication and sessions, authorization and access control, input handling, injection and XSS, CSRF, SSRF, file uploads and path handling, exposed secrets, and business logic.",
+      "4. Validate candidate issues with the minimum harmless evidence needed. If concrete evidence does not directly prove an issue, record only a fact or hypothesis; do not submit a finding.",
+      "5. Every finding must include: Description (nature of the vulnerability), Reproduction (safe steps to trigger it), Location (exact affected asset/URL/path/parameter/component), Impact (what an attacker achieves), and non-empty sanitized Evidence that directly proves it. Also include severity, confidence, and remediation. Summarize coverage, untested areas, and limitations.",
+      "Coordinator workflow: devise the plan first, dispatch independent Discovery, Authentication/Authorization, and Input/SSRF or Business Logic workers together when relevant, wait for the batch, review worker evidence and validator results, update the todolist/findings graph, then dispatch the next ready batch. Continue this loop until actionable work is exhausted or explicitly blocked.",
+      "",
+      "Safety limits: no denial-of-service or load testing, destructive changes, persistence, credential attacks, social engineering, lateral movement, or sensitive-data exfiltration. Stop and request clarification if authorization or scope is ambiguous.",
+      "",
+      "Important: simulated reconnaissance is disabled. Use available shell and Python tools for reconnaissance only on explicitly authorized in-scope assets. These tools run without per-run approval, are unrestricted and not sandboxed. Vulnerability validator probes still require explicit approval. Never claim remote assets were inspected or vulnerabilities verified without actual evidence.",
+    ].join("\n"),
+  },
+] as const;
+
 function ago(iso: string): string {
   const seconds = Math.max(1, Math.round((Date.now() - new Date(iso).getTime()) / 1000));
   if (seconds < 60) return `${seconds}s ago`;
@@ -24,11 +48,14 @@ export function TasksClient({ initialTasks, companies }: { initialTasks: TaskRow
   const [busy, setBusy] = useState<number | null>(null);
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [taskTemplate, setTaskTemplate] = useState("custom");
   const [form, setForm] = useState({
     name: "",
     target: "demo.example.com",
     goal: "",
+    context: "",
     concurrency: 3,
+    timeLimitMinutes: null as number | null,
     language: "en" as "en" | "ko",
     autoApprove: true,
   });
@@ -44,7 +71,9 @@ export function TasksClient({ initialTasks, companies }: { initialTasks: TaskRow
         name: form.name || undefined,
         target: form.target,
         goal: form.goal || undefined,
+        description: form.context || undefined,
         concurrency: form.concurrency,
+        timeLimitMinutes: form.timeLimitMinutes,
         language: form.language,
         autoApprove: form.autoApprove,
       }),
@@ -61,11 +90,17 @@ export function TasksClient({ initialTasks, companies }: { initialTasks: TaskRow
 
   async function control(id: number, action: string) {
     setBusy(id);
-    await fetch(`/api/tasks/${id}/control`, {
+    const response = await fetch(`/api/tasks/${id}/control`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ action }),
     });
+    if (!response.ok) {
+      const payload = (await response.json().catch(() => ({}))) as { reason?: string; error?: string };
+      setError(payload.reason ?? payload.error ?? "Could not control task");
+    } else {
+      setError(null);
+    }
     setBusy(null);
     router.refresh();
   }
@@ -92,6 +127,26 @@ export function TasksClient({ initialTasks, companies }: { initialTasks: TaskRow
 
       <Card title="Create a task" icon="target" subtitle={`New assets attach to ${companies[0]?.name ?? "the default company"}`}>
         <form onSubmit={createTask} className="grid gap-3 md:grid-cols-2">
+          <label className="space-y-1 md:col-span-2">
+            <span className="text-[11px] text-muted">Task template</span>
+            <select
+              value={taskTemplate}
+              onChange={(event) => {
+                const selected = TASK_TEMPLATES.find((template) => template.id === event.target.value) ?? TASK_TEMPLATES[0];
+                setTaskTemplate(selected.id);
+                setForm((current) => ({ ...current, name: selected.name, goal: selected.goal }));
+              }}
+            >
+              {TASK_TEMPLATES.map((template) => (
+                <option key={template.id} value={template.id}>{template.label}</option>
+              ))}
+            </select>
+            {taskTemplate === "full-pentest" && (
+              <span className="block text-[11px] text-faint">
+                Agent tasks require an active live model. Agents use shell/Python tools for reconnaissance; validator probes require explicit approval. Shell commands and Python scripts run without approval and are not sandboxed.
+              </span>
+            )}
+          </label>
           <label className="space-y-1">
             <span className="text-[11px] text-muted">Task name (optional)</span>
             <input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="External surface review" />
@@ -109,9 +164,34 @@ export function TasksClient({ initialTasks, companies }: { initialTasks: TaskRow
               placeholder="Map the attack surface and record any findings."
             />
           </label>
+          <label className="space-y-1 md:col-span-2">
+            <span className="text-[11px] text-muted">Supporting assessment context (optional)</span>
+            <textarea
+              rows={3}
+              value={form.context}
+              onChange={(e) => setForm({ ...form, context: e.target.value })}
+              placeholder="API routes, documentation, architecture notes, known authentication flows, or testing constraints. Do not include passwords, tokens, or other secrets."
+            />
+            <span className="block text-[11px] text-faint">
+              Context is stored with the task. Avoid including secrets. Agents cannot perform general target reconnaissance in this build.
+            </span>
+          </label>
           <label className="space-y-1">
             <span className="text-[11px] text-muted">Worker concurrency (1–10)</span>
             <input type="number" min={1} max={10} value={form.concurrency} onChange={(e) => setForm({ ...form, concurrency: Number(e.target.value) })} />
+          </label>
+          <label className="space-y-1">
+            <span className="text-[11px] text-muted">Time limit in minutes (optional)</span>
+            <input
+              type="number"
+              min={1}
+              max={1440}
+              step={1}
+              value={form.timeLimitMinutes ?? ""}
+              placeholder="No limit"
+              onChange={(e) => setForm({ ...form, timeLimitMinutes: e.target.value ? Number(e.target.value) : null })}
+            />
+            <span className="block text-[10px] text-faint">Wall-clock time from first start, including pauses. At expiry, assessment stops and supported findings enter approval-gated validation.</span>
           </label>
           <label className="space-y-1">
             <span className="text-[11px] text-muted">Language</span>

@@ -5,13 +5,16 @@ import { getSystemSettings } from "@/lib/repo";
 
 export default async function AppLayout({ children }: { children: React.ReactNode }) {
   const user = await requirePageUser();
-  const pendingApprovals = (await repo.listApprovals()).filter((approval) => approval.status === "pending").length;
+  const [pendingApprovals, settings] = await Promise.all([
+    repo.countPendingApprovals(),
+    getSystemSettings(),
+  ]);
 
   return (
     <AppShell
       username={user.username}
       pendingApprovals={pendingApprovals}
-      language={(await getSystemSettings()).language}
+      language={settings.language}
     >
       {children}
     </AppShell>

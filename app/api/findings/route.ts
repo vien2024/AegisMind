@@ -30,9 +30,28 @@ export async function POST(request: Request) {
     title?: string;
     severity?: string;
     description?: string;
+    reproduction?: string;
+    location?: string;
+    impact?: string;
     evidence?: string;
+    observed_payload?: string;
+    observed_result?: string;
   };
   if (!body.title?.trim()) return badRequest("title is required");
+  const requiredDetails = ["description", "reproduction", "location", "impact", "evidence"] as const;
+  for (const field of requiredDetails) {
+    if (typeof body[field] !== "string" || !body[field].trim()) {
+      return badRequest(`${field} is required and cannot be empty`);
+    }
+    if (body.observed_payload !== undefined &&
+        (typeof body.observed_payload !== "string" || body.observed_payload.length > 4096)) {
+      return badRequest("observed_payload must be a string of at most 4,096 characters");
+    }
+    if (body.observed_result !== undefined &&
+        (typeof body.observed_result !== "string" || body.observed_result.length > 8192)) {
+      return badRequest("observed_result must be a string of at most 8,192 characters");
+    }
+  }
   const severity: Severity =
     SEVERITIES.includes(body.severity as Severity)
       ? (body.severity as Severity)
@@ -43,8 +62,13 @@ export async function POST(request: Request) {
     nodeId: null,
     title: body.title.trim(),
     severity,
-    description: body.description,
-    evidence: body.evidence,
+    description: body.description!.trim(),
+    reproduction: body.reproduction!.trim(),
+    location: body.location!.trim(),
+    impact: body.impact!.trim(),
+    evidence: body.evidence!.trim(),
+    observedPayload: body.observed_payload,
+    observedResult: body.observed_result,
   });
   return Response.json({ finding }, { status: 201 });
 }

@@ -27,6 +27,7 @@ export interface OverviewPayload {
     input: number;
     output: number;
     cacheRead: number;
+    cacheWrite: number;
     runs: number;
     tasks: number;
     cacheHitRate: number;
@@ -37,62 +38,43 @@ export interface OverviewPayload {
 }
 
 export async function buildOverview(): Promise<OverviewPayload> {
-  const tasks = await repo.listTasks();
-  const allFindings = await repo.listFindings();
-  const assets = await repo.listAssets();
-  const usage = await repo.usageTotals();
+  const [taskGroups, findings, assets, usage, trafficTotal, activity, recentUsage] = await Promise.all([
+    repo.listTaskSummaries(),
+    repo.findingSummary(8),
+    repo.assetKindCounts(),
+    repo.usageTotals(),
+    repo.countTraffic(),
+    repo.listRecentActivity(30),
+    repo.listUsage(1),
+  ]);
 
-  const counts = (status: string) => tasks.filter((task) => task.status === status).length;
-  const bySeverity = allFindings.reduce<Record<string, number>>((acc, finding) => {
-    acc[finding.severity] = (acc[finding.severity] ?? 0) + 1;
-    return acc;
-  }, {});
-  const byKind = assets.reduce<Record<string, number>>((acc, asset) => {
-    acc[asset.kind] = (acc[asset.kind] ?? 0) + 1;
-    return acc;
-  }, {});
-
-  const taskName = (id: number | null) => tasks.find((task) => task.id === id)?.name ?? null;
-
-  const activity = (
-    await Promise.all(
-      tasks.map((task) => repo.listActivity(task.id, 40)),
-    )
-  )
-    .flat()
-    .sort((a, b) => b.id - a.id)
-    .slice(0, 30)
-    .map((entry) => ({ ...entry, task_name: taskName(entry.task_id) }));
-
-  const recent = allFindings.slice(0, 8).map((finding) => ({
-    ...finding,
-    task_name: taskName(finding.task_id),
-  }));
+  const counts = new Map(taskGroups.map((group) => [group.status, group.count]));
+  const count = (status: string) => counts.get(status) ?? 0;
 
   return {
     tasks: {
-      total: tasks.length,
-      running: counts("running"),
-      paused: counts("paused"),
-      completed: counts("completed"),
-      pending: counts("pending"),
-      failed: counts("failed"),
-      stopped: counts("stopped"),
+      total: taskGroups.reduce((sum, group) => sum + group.count, 0),
+      running: count("running"),
+      paused: count("paused"),
+      completed: count("completed"),
+      pending: count("pending"),
+      failed: count("failed"),
+      stopped: count("stopped"),
       activeIds: runningTaskIds(),
     },
-    assets: { total: assets.length, byKind },
+    assets,
     findings: {
-      total: allFindings.length,
-      confirmed: allFindings.filter((finding) => finding.status === "confirmed").length,
-      pending: allFindings.filter((finding) => finding.status === "pending").length,
-      bySeverity,
-      recent,
+      total: findings.total,
+      confirmed: findings.confirmed,
+      pending: findings.pending,
+      bySeverity: findings.bySeverity,
+      recent: findings.recent,
     },
-    traffic: { total: (await repo.listTraffic(undefined, 5000)).length },
+    traffic: { total: trafficTotal },
     usage: {
       ...usage,
       cacheHitRate: usage.total > 0 ? Math.round((usage.cacheRead / usage.total) * 100) : 0,
-      live: (await repo.listUsage(1)).some((row) => row.live === 1),
+      live: recentUsage.some((row) => row.live === 1),
     },
     activity,
     generatedAt: new Date().toISOString(),

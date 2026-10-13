@@ -14,6 +14,7 @@ export async function GET(request: Request, { params }: Params) {
   const nodes = await repo.listNodes(id, undefined, 2000);
   const edges = await repo.listEdges(id);
   const activity = await repo.listActivity(id, 1000);
+  const timeLimitReached = activity.some((entry) => entry.title === "task time limit reached");
 
   const format = new URL(request.url).searchParams.get("format") ?? "md";
 
@@ -22,9 +23,24 @@ export async function GET(request: Request, { params }: Params) {
   }
 
   if (format === "csv") {
-    const header = "id,severity,status,title,asset_id,disposition";
+    const header = "id,severity,status,title,description,reproduction,location,impact,evidence,validator_type,validator_status,validator_result,asset_id,disposition";
     const rows = findings.map((f) =>
-      [f.id, f.severity, f.status, JSON.stringify(f.title), f.asset_id ?? "", f.disposition ?? ""].join(","),
+      [
+        f.id,
+        f.severity,
+        f.status,
+        f.title,
+        f.description,
+        f.reproduction,
+        f.location,
+        f.impact,
+        f.evidence,
+        f.validator_type ?? "",
+        f.validator_status,
+        f.validator_result ?? "",
+        f.asset_id ?? "",
+        f.disposition ?? "",
+      ].map((value) => JSON.stringify(value ?? "")).join(","),
     );
     return new Response([header, ...rows].join("\n"), {
       headers: {
@@ -40,13 +56,27 @@ export async function GET(request: Request, { params }: Params) {
     `- Target: ${task.target}`,
     `- Status: ${task.status}`,
     `- Created: ${task.created_at}`,
+    `- Time limit: ${task.time_limit_minutes ? `${task.time_limit_minutes} minutes` : "none"}`,
+    `- Time limit reached: ${timeLimitReached ? "yes" : "no"}`,
+    `- Finished: ${task.finished_at ?? "not finished"}`,
     `- Language: ${task.language}`,
     "",
     "## Findings",
     "",
     ...[...findings]
       .sort((a, b) => a.severity.localeCompare(b.severity))
-      .map((f) => [`### [${f.severity.toUpperCase()}] ${f.title}`, "", f.description ?? "", "", `Evidence: ${f.evidence ?? "-"}`, ""])
+      .map((f) => [
+        `### [${f.severity.toUpperCase()}] ${f.title}`,
+        "",
+        `Description: ${f.description ?? "-"}`,
+        `Reproduction: ${f.reproduction ?? "-"}`,
+        `Location: ${f.location ?? "-"}`,
+        `Impact: ${f.impact ?? "-"}`,
+        `Evidence: ${f.evidence ?? "-"}`,
+        `Validation: ${f.validator_status}${f.validator_type ? ` (${f.validator_type}, parameter: ${f.validator_parameter ?? "-"})` : ""}`,
+        `Validation result: ${f.validator_result ?? "No validator result recorded."}`,
+        "",
+      ])
       .flat(),
     "## Exploration graph",
     "",
@@ -54,7 +84,7 @@ export async function GET(request: Request, { params }: Params) {
     `- Edges: ${edges.length}`,
     ...["goal", "intent", "fact", "finding", "hint"].map((kind) => `- ${kind}: ${nodes.filter((n) => n.kind === kind).length}`),
     "",
-    "> All activity in this edition is produced by a local, offline simulator. Nothing in this report corresponds to a live target.",
+    "> Simulated legacy records, if present, are not live evidence. Current task agents do not expose simulated reconnaissance; shell/Python reconnaissance runs with application-user permissions, while validator probes require separate operator approval.",
     "",
   ];
   return new Response(lines.join("\n"), {

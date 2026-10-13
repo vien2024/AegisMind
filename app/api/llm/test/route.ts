@@ -15,6 +15,9 @@ export async function POST(request: Request) {
     apiKey?: string;
   };
   if (!body.provider || !body.model) return badRequest("provider and model are required");
+  if (body.provider === "mock") {
+    return badRequest("Offline simulator profiles are not supported for agent tasks.");
+  }
 
   const resolved = buildModelFromParams({
     provider: body.provider,

@@ -97,6 +97,14 @@ export async function listAssets(filter?: {
   return rows.map(assetRow);
 }
 
+export async function assetKindCounts(): Promise<{ total: number; byKind: Record<string, number> }> {
+  const rows = await db()
+    .prepare("SELECT kind, COUNT(*) AS count FROM assets GROUP BY kind")
+    .all() as Array<{ kind: string; count: number | string }>;
+  const byKind = Object.fromEntries(rows.map((row) => [row.kind, Number(row.count)]));
+  return { total: Object.values(byKind).reduce((sum, count) => sum + count, 0), byKind };
+}
+
 export async function getAsset(id: number): Promise<Asset | undefined> {
   const row = await db()
     .prepare("SELECT * FROM assets WHERE id = $1")
@@ -192,6 +200,13 @@ export async function listTasks(): Promise<Task[]> {
   return (rows as unknown[]).map(taskRow);
 }
 
+export async function listTaskSummaries(): Promise<Array<{ status: string; count: number }>> {
+  const rows = await db()
+    .prepare("SELECT status, COUNT(*) AS count FROM tasks GROUP BY status")
+    .all() as Array<{ status: string; count: number | string }>;
+  return rows.map((row) => ({ status: row.status, count: Number(row.count) }));
+}
+
 export async function getTask(id: number): Promise<Task | undefined> {
   const row = await db()
     .prepare("SELECT * FROM tasks WHERE id = $1")
@@ -206,12 +221,13 @@ export async function createTask(input: {
   goal?: string;
   language?: Language;
   concurrency?: number;
+  timeLimitMinutes?: number | null;
   autoApprove?: boolean;
 }): Promise<Task> {
   const info = await db()
     .prepare(
-      `INSERT INTO tasks (name, target, description, goal, status, language, concurrency, auto_approve, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7, $8, $9) RETURNING id`,
+      `INSERT INTO tasks (name, target, description, goal, status, language, concurrency, time_limit_minutes, auto_approve, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7, $8, $9, $10) RETURNING id`,
     )
     .run(
       input.name,
@@ -220,6 +236,7 @@ export async function createTask(input: {
       input.goal ?? null,
       input.language ?? "en",
       input.concurrency ?? 3,
+      input.timeLimitMinutes ?? null,
       input.autoApprove !== false,
       now(),
       now(),
@@ -238,6 +255,7 @@ export async function updateTask(id: number, patch: Partial<Task>): Promise<void
     "status",
     "language",
     "concurrency",
+    "time_limit_minutes",
     "auto_approve",
     "error",
     "started_at",
@@ -363,15 +381,15 @@ export async function listNodes(
 ): Promise<ExplorationNode[]> {
   const rows = kind
     ? await db()
-        .prepare(
-          "SELECT * FROM exploration_nodes WHERE task_id = $1 AND kind = $2 ORDER BY id DESC LIMIT $3",
-        )
-        .all(taskId, kind, limit)
+      .prepare(
+        "SELECT * FROM exploration_nodes WHERE task_id = $1 AND kind = $2 ORDER BY id DESC LIMIT $3",
+      )
+      .all(taskId, kind, limit)
     : await db()
-        .prepare(
-          "SELECT * FROM exploration_nodes WHERE task_id = $1 ORDER BY id DESC LIMIT $2",
-        )
-        .all(taskId, limit);
+      .prepare(
+        "SELECT * FROM exploration_nodes WHERE task_id = $1 ORDER BY id DESC LIMIT $2",
+      )
+      .all(taskId, limit);
   return (rows as unknown[]).map(nodeRow);
 }
 
@@ -425,6 +443,37 @@ export async function listAnchoredAssetIds(
     .prepare("SELECT asset_id FROM exploration_anchors WHERE node_id = $1")
     .all(nodeId) as { asset_id: number }[];
   return rows.map((r) => r.asset_id);
+}
+
+export async function listAnchorsForNodes(
+  nodeIds: number[],
+): Promise<Array<{ node_id: number; asset_id: number }>> {
+  if (nodeIds.length === 0) return [];
+  return db()
+    .prepare("SELECT node_id, asset_id FROM exploration_anchors WHERE node_id = ANY($1::int[])")
+    .all(nodeIds) as unknown as Promise<Array<{ node_id: number; asset_id: number }>>;
+}
+
+export async function listAssetsByIds(ids: number[]): Promise<Asset[]> {
+  if (ids.length === 0) return [];
+  const rows = await db()
+    .prepare("SELECT * FROM assets WHERE id = ANY($1::int[])")
+    .all(ids);
+  return rows.map(assetRow);
+}
+
+export async function listTestedScopeAssetIds(taskId: number): Promise<number[]> {
+  const rows = await db()
+    .prepare(
+      `SELECT DISTINCT scope.asset_id
+       FROM task_scope scope
+       JOIN exploration_anchors anchor ON anchor.asset_id = scope.asset_id
+       JOIN exploration_nodes node ON node.id = anchor.node_id
+       WHERE scope.task_id = $1 AND node.task_id = $1
+         AND node.kind IN ('intent', 'fact', 'finding')`,
+    )
+    .all(taskId) as Array<{ asset_id: number }>;
+  return rows.map((row) => row.asset_id);
 }
 
 export async function listNodeIdsForAsset(
@@ -503,6 +552,24 @@ export async function listActivity(
   return (rows as unknown[]).map(activityRow).reverse();
 }
 
+export async function listRecentActivity(
+  limit: number,
+): Promise<Array<ActivityRecord & { task_name: string | null }>> {
+  const rows = await db()
+    .prepare(
+      `SELECT activity.*, tasks.name AS task_name
+       FROM activity
+       LEFT JOIN tasks ON tasks.id = activity.task_id
+       ORDER BY activity.id DESC
+       LIMIT $1`,
+    )
+    .all(limit) as Array<Record<string, unknown>>;
+  return rows.map((row) => ({
+    ...activityRow(row),
+    task_name: typeof row.task_name === "string" ? row.task_name : null,
+  }));
+}
+
 export async function listIntentActivity(
   intentId: number,
 ): Promise<ActivityRecord[]> {
@@ -553,13 +620,30 @@ export async function createFinding(input: {
   nodeId: number | null;
   title: string;
   severity: Severity;
-  description?: string;
-  evidence?: string;
+  description: string;
+  reproduction: string;
+  location: string;
+  impact: string;
+  evidence: string;
+  observedPayload?: string | null;
+  observedResult?: string | null;
 }): Promise<Finding> {
+  const requiredDetails = ["description", "reproduction", "location", "impact", "evidence"] as const;
+  for (const field of requiredDetails) {
+    if (typeof input[field] !== "string" || !input[field].trim()) {
+      throw new Error(`Finding ${field} is required and cannot be empty.`);
+    }
+  }
+  if ((input.observedPayload?.length ?? 0) > 4096) {
+    throw new Error("Finding observed payload cannot exceed 4,096 characters.");
+  }
+  if ((input.observedResult?.length ?? 0) > 8192) {
+    throw new Error("Finding observed result cannot exceed 8,192 characters.");
+  }
   const info = await db()
     .prepare(
-      `INSERT INTO findings (task_id, asset_id, node_id, title, severity, status, description, evidence, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7, $8, $9) RETURNING id`,
+      `INSERT INTO findings (task_id, asset_id, node_id, title, severity, status, description, reproduction, location, impact, evidence, observed_payload, observed_result, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING id`,
     )
     .run(
       input.taskId,
@@ -567,8 +651,13 @@ export async function createFinding(input: {
       input.nodeId,
       input.title,
       input.severity,
-      input.description ?? null,
-      input.evidence ?? null,
+      input.description.trim(),
+      input.reproduction.trim(),
+      input.location.trim(),
+      input.impact.trim(),
+      input.evidence.trim(),
+      input.observedPayload?.trim() || null,
+      input.observedResult?.trim() || null,
       now(),
       now(),
     );
@@ -584,10 +673,52 @@ export async function listFindings(
   const rows =
     taskId
       ? await db()
-          .prepare("SELECT * FROM findings WHERE task_id = $1 ORDER BY id DESC")
-          .all(taskId)
+        .prepare("SELECT * FROM findings WHERE task_id = $1 ORDER BY id DESC")
+        .all(taskId)
       : await db().prepare("SELECT * FROM findings ORDER BY id DESC").all();
   return rows as unknown as Finding[];
+}
+
+export async function findingSummary(limit = 8): Promise<{
+  total: number;
+  confirmed: number;
+  pending: number;
+  bySeverity: Record<string, number>;
+  recent: Array<Finding & { task_name: string | null }>;
+}> {
+  const [groups, recentRows] = await Promise.all([
+    db()
+      .prepare("SELECT severity, status, COUNT(*) AS count FROM findings GROUP BY severity, status")
+      .all() as Promise<Array<{ severity: string; status: string; count: number | string }>>,
+    db()
+      .prepare(
+        `SELECT findings.*, tasks.name AS task_name
+         FROM findings LEFT JOIN tasks ON tasks.id = findings.task_id
+         ORDER BY findings.id DESC LIMIT $1`,
+      )
+      .all(limit) as Promise<Array<Record<string, unknown>>>,
+  ]);
+  const bySeverity: Record<string, number> = {};
+  let total = 0;
+  let confirmed = 0;
+  let pending = 0;
+  for (const group of groups) {
+    const count = Number(group.count);
+    total += count;
+    bySeverity[group.severity] = (bySeverity[group.severity] ?? 0) + count;
+    if (group.status === "confirmed") confirmed += count;
+    if (group.status === "pending") pending += count;
+  }
+  return {
+    total,
+    confirmed,
+    pending,
+    bySeverity,
+    recent: recentRows.map((row) => ({
+      ...(row as unknown as Finding),
+      task_name: typeof row.task_name === "string" ? row.task_name : null,
+    })),
+  };
 }
 
 export async function getFinding(id: number): Promise<Finding | undefined> {
@@ -601,20 +732,48 @@ export async function updateFinding(
   id: number,
   patch: Partial<Finding>,
 ): Promise<void> {
+  const requiredDetails = ["description", "reproduction", "location", "impact", "evidence"] as const;
+  for (const field of requiredDetails) {
+    const value = patch[field];
+    if (value !== undefined && (typeof value !== "string" || !value.trim())) {
+      throw new Error(`Finding ${field} cannot be empty.`);
+    }
+  }
+  if (patch.observed_payload !== undefined && patch.observed_payload !== null &&
+      (typeof patch.observed_payload !== "string" || patch.observed_payload.length > 4096)) {
+    throw new Error("Finding observed payload must be at most 4,096 characters.");
+  }
+  if (patch.observed_result !== undefined && patch.observed_result !== null &&
+      (typeof patch.observed_result !== "string" || patch.observed_result.length > 8192)) {
+    throw new Error("Finding observed result must be at most 8,192 characters.");
+  }
   const allowed: (keyof Finding)[] = [
     "status",
     "disposition",
     "severity",
     "fix_version",
     "description",
+    "reproduction",
+    "location",
+    "impact",
     "evidence",
+    "observed_payload",
+    "observed_result",
   ];
   const fields: string[] = [];
   const params: unknown[] = [];
   for (const key of allowed) {
     if (patch[key] !== undefined) {
       fields.push(`${key} = $${params.length + 1}`);
-      params.push(patch[key]);
+      const value = patch[key];
+      params.push(
+        (requiredDetails.includes(key as (typeof requiredDetails)[number]) ||
+          key === "observed_payload" ||
+          key === "observed_result") &&
+        typeof value === "string"
+          ? value.trim()
+          : value,
+      );
     }
   }
   if (!fields.length) return;
@@ -624,6 +783,40 @@ export async function updateFinding(
   await db()
     .prepare(`UPDATE findings SET ${fields.join(", ")} WHERE id = $${params.length}`)
     .run(...params);
+}
+
+export async function recordFindingValidation(input: {
+  findingId: number;
+  type: Finding["validator_type"];
+  parameter: string;
+  payload: string;
+  status: Finding["validator_status"];
+  result: string;
+  description?: string;
+}): Promise<void> {
+  const confirmed = input.status === "confirmed";
+  await db()
+    .prepare(
+      `UPDATE findings
+       SET validator_type = $1, validator_parameter = $2, validator_payload = $3,
+           validator_status = $4, validator_result = $5,
+           validated_at = CASE WHEN $4 = 'awaiting_approval' THEN validated_at ELSE $6 END,
+           status = CASE WHEN $7 THEN 'confirmed' WHEN status IN ('pending', 'potential') THEN 'potential' ELSE status END,
+           description = COALESCE($8, description),
+           updated_at = $6
+       WHERE id = $9`,
+    )
+    .run(
+      input.type,
+      input.parameter,
+      input.payload,
+      input.status,
+      input.result,
+      now(),
+      confirmed,
+      input.description ?? null,
+      input.findingId,
+    );
 }
 
 /* ------------------------------------------------------------------ */
@@ -665,10 +858,17 @@ export async function listApprovals(
   const rows =
     taskId
       ? await db()
-          .prepare("SELECT * FROM approvals WHERE task_id = $1 ORDER BY id DESC")
-          .all(taskId)
+        .prepare("SELECT * FROM approvals WHERE task_id = $1 ORDER BY id DESC")
+        .all(taskId)
       : await db().prepare("SELECT * FROM approvals ORDER BY id DESC").all();
   return rows as unknown as Approval[];
+}
+
+export async function countPendingApprovals(): Promise<number> {
+  const row = await db()
+    .prepare("SELECT COUNT(*) AS count FROM approvals WHERE status = 'pending'")
+    .get() as { count: number | string };
+  return Number(row.count);
 }
 
 export async function findDecidedApproval(
@@ -733,14 +933,21 @@ export async function listTraffic(
   const rows =
     taskId
       ? await db()
-          .prepare(
-            "SELECT * FROM traffic WHERE task_id = $1 ORDER BY id DESC LIMIT $2",
-          )
-          .all(taskId, limit)
+        .prepare(
+          "SELECT * FROM traffic WHERE task_id = $1 ORDER BY id DESC LIMIT $2",
+        )
+        .all(taskId, limit)
       : await db()
-          .prepare("SELECT * FROM traffic ORDER BY id DESC LIMIT $1")
-          .all(limit);
+        .prepare("SELECT * FROM traffic ORDER BY id DESC LIMIT $1")
+        .all(limit);
   return rows as unknown as TrafficRecord[];
+}
+
+export async function countTraffic(): Promise<number> {
+  const row = await db()
+    .prepare("SELECT COUNT(*) AS count FROM traffic")
+    .get() as { count: number | string };
+  return Number(row.count);
 }
 
 /* ------------------------------------------------------------------ */
@@ -904,22 +1111,22 @@ export async function usageByModel(): Promise<
 > {
   const rows = await db()
     .prepare(
-      `SELECT model, provider, MAX(live) as live, COUNT(*) as runs,
+      `SELECT model, provider, BOOL_OR(live) as live, COUNT(*) as runs,
               SUM(input_tokens) as input, SUM(output_tokens) as output,
               SUM(cache_read_tokens) as cacheRead,
               SUM(input_tokens + output_tokens + cache_read_tokens) as total
        FROM llm_usage GROUP BY model, provider ORDER BY total DESC`,
     )
     .all() as Array<{
-    model: string;
-    provider: string;
-    live: boolean | number;
-    runs: number;
-    input: number;
-    output: number;
-    cacheRead: number;
-    total: number;
-  }>;
+      model: string;
+      provider: string;
+      live: boolean | number;
+      runs: number;
+      input: number;
+      output: number;
+      cacheRead: number;
+      total: number;
+    }>;
   return rows.map((r) => ({
     model: r.model,
     provider: r.provider,
@@ -945,14 +1152,14 @@ export async function usageTotals(model?: string) {
        FROM llm_usage${model ? " WHERE model = $1" : ""}`,
     )
     .get(...(model ? [model] : [])) as {
-    runs: number;
-    tasks: number;
-    input: number;
-    output: number;
-    cacheRead: number;
-    cacheWrite: number;
-    total: number;
-  };
+      runs: number;
+      tasks: number;
+      input: number;
+      output: number;
+      cacheRead: number;
+      cacheWrite: number;
+      total: number;
+    };
   return row;
 }
 
@@ -963,8 +1170,8 @@ export async function usageSeries(
 ) {
   const key =
     bucket === "day"
-      ? "to_char(created_at, 'YYYY-MM-DD')"
-      : "to_char(created_at, 'YYYY-MM')";
+      ? "to_char(created_at::timestamptz, 'YYYY-MM-DD')"
+      : "to_char(created_at::timestamptz, 'YYYY-MM')";
   const filter = model ? "AND model = $2" : "";
   const rows = await db()
     .prepare(
@@ -976,11 +1183,11 @@ export async function usageSeries(
        GROUP BY bucket ORDER BY bucket`,
     )
     .all(sinceIso, ...(model ? [model] : [])) as Array<{
-    bucket: string;
-    input: number;
-    output: number;
-    cacheRead: number;
-  }>;
+      bucket: string;
+      input: number;
+      output: number;
+      cacheRead: number;
+    }>;
   return rows;
 }
 

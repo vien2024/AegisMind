@@ -30,18 +30,16 @@ const ROLE_TONE: Record<string, string> = {
 };
 
 function RoleChip({ role }: { role: string }) {
-  const tone = role.startsWith("worker") ? "badge-low" : (ROLE_TONE[role] ?? "badge-neutral");
+  const tone = role.endsWith(" agent") ? "badge-low" : (ROLE_TONE[role] ?? "badge-neutral");
   return <span className={`badge ${tone}`}>{role}</span>;
 }
 
 export function DashboardLive({
   initial,
   usageInitial,
-  live,
 }: {
   initial: OverviewPayload;
   usageInitial: React.ComponentProps<typeof TokenUsageCard>["initial"];
-  live: boolean;
 }) {
   const [data, setData] = useState(initial);
   const [typeFilter, setTypeFilter] = useState<string | null>(null);
@@ -69,20 +67,16 @@ export function DashboardLive({
     <>
       <SectionHeading title="Overview" subtitle="Global system status · Refreshes live" />
 
-      {!live && (
-        <div className="flex items-start gap-2 rounded-lg border border-border bg-subtle px-3 py-2 text-[11px] text-muted">
-          <Icon name="alert" className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-          <span>
-            <strong className="font-semibold text-ink">Offline simulator mode.</strong> No LLM provider is
-            configured, so planner and worker agents run against a deterministic local model and all
-            reconnaissance is simulated. Add an OpenAI or Anthropic key under{" "}
-            <Link href="/llm" className="text-link underline">
-              LLM
-            </Link>{" "}
-            to run live agent workflows.
-          </span>
-        </div>
-      )}
+      <div className="flex items-start gap-2 rounded-lg border border-border bg-subtle px-3 py-2 text-[11px] text-muted">
+        <Icon name="alert" className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+        <span>
+          <strong className="font-semibold text-ink">Live-only agent mode.</strong> Task agents require
+          an active live model; simulated reconnaissance is disabled. A limited, manually approved
+          HTTP mapper is available for explicitly scoped targets. Configure a provider under{" "}
+          <Link href="/llm" className="text-link underline">LLM</Link>. Agents can also run shell commands
+          and Python scripts from the workspace without per-run approval; these are not sandboxed.
+        </span>
+      </div>
 
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-5">
         <div className="card p-4">
@@ -152,7 +146,7 @@ export function DashboardLive({
           </div>
           <div className="mt-2 text-2xl font-semibold leading-none tracking-tight text-ink">{data.traffic.total}</div>
           <div className="mt-2 flex items-center gap-1 text-[11px] text-faint">
-            <span className="h-1.5 w-1.5 rounded-full bg-blue-500" /> {live ? "Recording" : "Simulated"}
+            <span className="h-1.5 w-1.5 rounded-full bg-blue-500" /> Live probes and legacy records
           </div>
         </div>
 
